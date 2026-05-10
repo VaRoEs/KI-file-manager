@@ -1,0 +1,1937 @@
+#include <shlwapi.h>
+#include <shlobj.h>
+#include <shobjidl.h>
+#include <stdio.h>
+
+#ifndef CMD_PROP_COPY
+#define CMD_PROP_COPY  (WM_APP+201)
+#endif
+#ifndef CMD_PROP_PASTE
+#define CMD_PROP_PASTE (WM_APP+202)
+#endif
+#ifndef CMD_CREATE_SHORTCUT
+#define CMD_CREATE_SHORTCUT 12
+#endif
+
+static void SetClipboardText(HWND owner, const wchar_t* text) {
+    if (!text || !*text) return;
+    if (!OpenClipboard(owner)) return;
+    EmptyClipboard();
+    SIZE_T bytes = (wcslen(text)+1)*sizeof(wchar_t);
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (h) {
+        void* p = GlobalLock(h);
+        if (p) { memcpy(p, text, bytes); GlobalUnlock(h); SetClipboardData(CF_UNICODETEXT, h); }
+        else GlobalFree(h);
+    }
+    CloseClipboard();
+}
+
+static void TrimInPlaceW(wchar_t* s) {
+    if (!s) return;
+    wchar_t* p = s; while (*p==L' '||*p==L'\t'||*p==L'\r'||*p==L'\n'||*p==L'\"'||*p==L'\'') ++p;
+    if (p!=s) { size_t k=0; while (p[k]) { s[k]=p[k]; ++k; } s[k]=0; }
+    size_t n = lstrlenW(s);
+    while (n>0) {
+        wchar_t c = s[n-1];
+        if (c==L' '||c==L'\t'||c==L'\r'||c==L'\n'||c==L'\"'||c==L'\'') { s[n-1]=0; --n; }
+        else break;
+    }
+}
+
+static int SplitLinesToArray(const wchar_t* text, wchar_t** outArr, int maxItems) {
+    int count = 0; const wchar_t* s = text;
+    while (*s && count < maxItems) {
+        const wchar_t* e = s; while (*e && *e!=L'\r' && *e!=L'\n') ++e;
+        int len = (int)(e - s);
+        if (len > 0) {
+            outArr[count] = (wchar_t*)LocalAlloc(LMEM_FIXED, (len+1)*sizeof(wchar_t));
+            if (outArr[count]) { lstrcpynW(outArr[count], s, len+1); TrimInPlaceW(outArr[count]); if (outArr[count][0]) count++; else { LocalFree(outArr[count]); outArr[count]=NULL; } }
+        }
+        while (*e==L'\r' || *e==L'\n') ++e;
+        s = e;
+    } return count;
+}
+
+static void FreeArray(wchar_t** arr, int count) { for (int i=0;i<count;i++) if (arr[i]) LocalFree(arr[i]); }
+
+static wchar_t* BuildDoubleNullMultiString(wchar_t** arr, int count) {
+    size_t total = 1; for (int i=0;i<count;i++) total += lstrlenW(arr[i]) + 1;
+    wchar_t* buf = (wchar_t*)LocalAlloc(LMEM_FIXED, total * sizeof(wchar_t));
+    if (!buf) return NULL;
+    wchar_t* p = buf; for (int i=0;i<count;i++) { lstrcpyW(p, arr[i]); p += lstrlenW(p)+1; } *p = 0; return buf;
+}
+
+static void CreateLink(LPCWSTR lpszPathObj, LPCWSTR lpszPathLink, LPCWSTR lpszDesc) {
+    IShellLinkW* psl;
+    if (SUCCEEDED(CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, (LPVOID*)&psl))) {
+        psl->lpVtbl->SetPath(psl, lpszPathObj); psl->lpVtbl->SetDescription(psl, lpszDesc);
+        IPersistFile* ppf;
+        if (SUCCEEDED(psl->lpVtbl->QueryInterface(psl, &IID_IPersistFile, (LPVOID*)&ppf))) { ppf->lpVtbl->Save(ppf, lpszPathLink, TRUE); ppf->lpVtbl->Release(ppf); }
+        psl->lpVtbl->Release(psl);
+    }
+}
+
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
+
+#include <windows.h>
+#include <windowsx.h>
+#include <tchar.h>
+#include <stdint.h>
+#include <math.h>
+#include <wctype.h>
+#include <wchar.h>
+#include <shellapi.h>
+
+static BOOL g_multiSelectMode = FALSE;
+static float g_iconScale = 1.0f;
+
+static const wchar_t* kWndClass         = L"MacSystem1StyleWnd";
+static const wchar_t* kDlgClass         = L"MacMiniDialog";
+static const wchar_t* kMenuClass        = L"MacPopupMenu";
+static const wchar_t* kTopBarClass      = L"MacTopBar";
+static const wchar_t* kAppleClass       = L"MacAppleMenu";
+static const wchar_t* kApplePopupClass  = L"MacApplePopup";
+static const wchar_t* kProgClass        = L"MacProgressWnd";
+
+static float dpi_scale = 1.0f;
+static HINSTANCE g_hInst;
+static int g_windowCount = 0; 
+static int g_tbTrashAnim = 0;
+
+static int S(int px) { return (int)lroundf(px * dpi_scale); }
+static BOOL PtIn(const RECT* r, int x, int y) { return (x>=r->left && x<r->right && y>=r->top && y<r->bottom); }
+
+static void SetDpiAware(void) {
+    HMODULE hUser = GetModuleHandleW(L"user32.dll");
+    if (hUser) { typedef BOOL (WINAPI *SetProc)(HANDLE); SetProc p = (SetProc)GetProcAddress(hUser, "SetProcessDpiAwarenessContext"); if (p) { p((HANDLE)-4); return; } }
+    SetProcessDPIAware();
+}
+
+static void PickClassicFont(HFONT *outFont, int heightPx, BOOL bold) {
+    LOGFONTW lf = {0}; lf.lfHeight = -S(heightPx); lf.lfWeight = bold ? FW_BOLD : FW_NORMAL; lf.lfQuality = ANTIALIASED_QUALITY;
+    const wchar_t* candidates[] = { L"Chicago", L"Geneva", L"Charcoal", L"MS Sans Serif", L"System" };
+    HFONT f = NULL; for (int i=0;i<5; ++i) { lstrcpyW(lf.lfFaceName, candidates[i]); f = CreateFontIndirectW(&lf); if (f) break; }
+    if (!f) { f = (HFONT)GetStockObject(SYSTEM_FONT); }
+    *outFont = f;
+}
+
+static void DrawTooltipSmall(HDC dc, RECT r, const wchar_t* title, const wchar_t* line) {
+    HBRUSH bg = CreateSolidBrush(RGB(255,255,255)); FillRect(dc, &r, bg); DeleteObject(bg);
+    Rectangle(dc, r.left, r.top, r.right, r.bottom);
+    HFONT fBold = CreateFontW(15,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,0,0,L"Segoe UI");
+    HFONT fReg  = CreateFontW(13,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,0,0,L"Segoe UI");
+    HGDIOBJ of = SelectObject(dc, fBold);
+    RECT t = (RECT){ r.left+6, r.top+4, r.right-6, r.top+22 };
+    DrawTextW(dc, title, -1, &t, DT_LEFT|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX|DT_END_ELLIPSIS);
+    SelectObject(dc, fReg);
+    RECT d = (RECT){ r.left+6, t.bottom+2, r.right-6, r.bottom-6 };
+    DrawTextW(dc, line, -1, &d, DT_LEFT|DT_WORDBREAK|DT_NOPREFIX|DT_EDITCONTROL);
+    SelectObject(dc, of); DeleteObject(fBold); DeleteObject(fReg);
+}
+
+static wchar_t g_assocFile[MAX_PATH] = L"";
+static wchar_t g_favFile[MAX_PATH] = L"";
+
+static void EnsureAssocFile(void) {
+    if (g_assocFile[0]) return;
+    lstrcpyW(g_assocFile, L"C:\\ki_assoc.txt");
+    HANDLE h = CreateFileW(g_assocFile, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); return; }
+
+    h = CreateFileW(g_assocFile, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        if (GetLastError() == ERROR_ACCESS_DENIED) { 
+            GetEnvironmentVariableW(L"USERPROFILE", g_assocFile, MAX_PATH);
+            lstrcatW(g_assocFile, L"\\ki_assoc.txt");
+            h = CreateFileW(g_assocFile, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        }
+    }
+    if (h != INVALID_HANDLE_VALUE) {
+        const wchar_t* def = L"\xFEFF" 
+                             L"1) Notepad --C:\\Windows\\notepad.exe-- .txt .ini .log .cfg\r\n"
+                             L"2) Explorer --C:\\Windows\\explorer.exe-- .exe .bat .cmd\r\n"
+                             L"3) Paint --C:\\Windows\\system32\\mspaint.exe-- .png .jpg .jpeg .bmp\r\n"
+                             L"4) Media --C:\\Program Files\\Windows Media Player\\wmplayer.exe-- .mp4 .mp3 .avi\r\n";
+        DWORD written;
+        WriteFile(h, def, lstrlenW(def)*sizeof(wchar_t), &written, NULL);
+        CloseHandle(h);
+    }
+}
+
+static void EnsureFavFile(void) {
+    if (g_favFile[0]) return;
+    lstrcpyW(g_favFile, L"C:\\ki_favorites.txt");
+    HANDLE h = CreateFileW(g_favFile, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); return; }
+    
+    h = CreateFileW(g_favFile, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        if (GetLastError() == ERROR_ACCESS_DENIED) {
+            GetEnvironmentVariableW(L"USERPROFILE", g_favFile, MAX_PATH);
+            lstrcatW(g_favFile, L"\\ki_favorites.txt");
+            h = CreateFileW(g_favFile, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        }
+    }
+    if (h != INVALID_HANDLE_VALUE) {
+        const wchar_t* def = L"\xFEFF"; 
+        DWORD written;
+        WriteFile(h, def, lstrlenW(def)*sizeof(wchar_t), &written, NULL);
+        CloseHandle(h);
+    }
+}
+
+static BOOL RunWithAssoc(const wchar_t* filePath) {
+    EnsureAssocFile();
+    const wchar_t* ext = wcsrchr(filePath, L'.');
+    if (!ext) return FALSE;
+
+    FILE* f = _wfopen(g_assocFile, L"rt,ccs=UTF-8");
+    if (!f) return FALSE;
+
+    wchar_t line[1024];
+    BOOL launched = FALSE;
+    while (fgetws(line, 1024, f)) {
+        wchar_t* p1 = wcsstr(line, L"--");
+        if (!p1) continue;
+        wchar_t* exeStart = p1 + 2;
+        wchar_t* p2 = wcsstr(exeStart, L"--");
+        if (!p2) continue;
+        *p2 = 0; 
+        wchar_t* exts = p2 + 2;
+
+        wchar_t extLower[64]; lstrcpynW(extLower, ext, 63); CharLowerW(extLower);
+        wchar_t extsLower[512]; lstrcpynW(extsLower, exts, 511); CharLowerW(extsLower);
+
+        if (wcsstr(extsLower, extLower)) {
+            ShellExecuteW(NULL, L"open", exeStart, filePath, NULL, SW_SHOWNORMAL);
+            launched = TRUE; break;
+        }
+    }
+    fclose(f);
+    return launched;
+}
+
+static void DrawFolderIcon(HDC dc, int x, int y, int size) {
+    int w = size, h = (int)(size*0.75f);
+    int tabW = (int)(w*0.35f), tabH = (int)(h*0.2f);
+    int yOff = y + (size - h)/2 + (int)(size*0.05f);
+    int s1 = max(1, (int)(size*0.02f)), s2 = max(1, (int)(size*0.04f)), s4 = max(1, (int)(size*0.08f));
+    int s8 = max(1, (int)(size*0.15f));
+
+    HBRUSH bShadow = CreateSolidBrush(RGB(180, 180, 180));
+    POINT ptShadow[] = { {x+s4, yOff+tabH+s4}, {x+w+s2, yOff+tabH+s4}, {x+w-s2, yOff+h+s4}, {x+s2, yOff+h+s4} };
+    HRGN rgnShadow = CreatePolygonRgn(ptShadow, 4, WINDING);
+    FillRgn(dc, rgnShadow, bShadow); DeleteObject(rgnShadow); DeleteObject(bShadow);
+
+    HPEN pEdge = CreatePen(PS_SOLID, s1, RGB(160, 120, 40));
+    HBRUSH bBack = CreateSolidBrush(RGB(240, 200, 100));
+    HGDIOBJ oldP = SelectObject(dc, pEdge);
+    HGDIOBJ oldB = SelectObject(dc, bBack);
+    POINT ptBack[] = { {x, yOff+tabH}, {x, yOff}, {x+tabW, yOff}, {x+tabW+s4, yOff+tabH}, {x+w, yOff+tabH}, {x+w, yOff+h}, {x, yOff+h} };
+    Polygon(dc, ptBack, 7);
+    
+    HBRUSH bPaper = CreateSolidBrush(RGB(250, 250, 250));
+    HPEN pPaper = CreatePen(PS_SOLID, s1, RGB(200, 200, 200));
+    SelectObject(dc, bPaper); SelectObject(dc, pPaper);
+    Rectangle(dc, x+s4, yOff+tabH-s4, x+w-s8, yOff+h-s4);
+    MoveToEx(dc, x+s8, yOff+tabH, NULL); LineTo(dc, x+w-s8-s4, yOff+tabH);
+    MoveToEx(dc, x+s8, yOff+tabH+s4, NULL); LineTo(dc, x+w-s8-s8, yOff+tabH+s4);
+    
+    HBRUSH bFront = CreateSolidBrush(RGB(255, 220, 130));
+    HPEN pFront = CreatePen(PS_SOLID, s1, RGB(180, 140, 50));
+    SelectObject(dc, bFront); SelectObject(dc, pFront);
+    POINT ptFront[] = { {x, yOff+h}, {x+s8, yOff+tabH}, {x+w, yOff+tabH}, {x+w-s8, yOff+h} };
+    Polygon(dc, ptFront, 4);
+
+    HPEN pHi = CreatePen(PS_SOLID, s1, RGB(255, 245, 200));
+    SelectObject(dc, pHi);
+    MoveToEx(dc, x+s8+s1, yOff+tabH+s1, NULL); LineTo(dc, x+w-s2, yOff+tabH+s1);
+    
+    SelectObject(dc, oldP); SelectObject(dc, oldB);
+    DeleteObject(pEdge); DeleteObject(bBack); DeleteObject(bPaper); DeleteObject(pPaper);
+    DeleteObject(bFront); DeleteObject(pFront); DeleteObject(pHi);
+}
+
+static void DrawFloppyIcon(HDC dc, int x, int y, int size) {
+    int w = (int)(size * 0.75f);
+    int h = size;
+    int dx = x + (size - w)/2;
+    int dy = y;
+    int fold = (int)(w * 0.3f);
+    int s1 = max(1, (int)(size*0.02f)), s3 = max(1, (int)(size*0.05f)), s6 = max(1, (int)(size*0.1f)), s12 = max(1, (int)(size*0.2f));
+
+    HBRUSH bShadow = CreateSolidBrush(RGB(180, 180, 180));
+    POINT ptShadow[] = { {dx+s3, dy+s3}, {dx+w+s3, dy+s3+fold}, {dx+w+s3, dy+h+s3}, {dx+s3, dy+h+s3} };
+    HRGN rgnShadow = CreatePolygonRgn(ptShadow, 4, WINDING);
+    FillRgn(dc, rgnShadow, bShadow); DeleteObject(rgnShadow); DeleteObject(bShadow);
+
+    HBRUSH bPaper = CreateSolidBrush(RGB(255, 255, 255));
+    HPEN pEdge = CreatePen(PS_SOLID, s1, RGB(100, 100, 100));
+    HGDIOBJ oldP = SelectObject(dc, pEdge);
+    HGDIOBJ oldB = SelectObject(dc, bPaper);
+    
+    POINT ptDoc[] = { {dx, dy}, {dx+w-fold, dy}, {dx+w, dy+fold}, {dx+w, dy+h}, {dx, dy+h} };
+    Polygon(dc, ptDoc, 5);
+
+    HBRUSH bFold = CreateSolidBrush(RGB(220, 220, 230));
+    SelectObject(dc, bFold);
+    POINT ptFold[] = { {dx+w-fold, dy}, {dx+w-fold, dy+fold}, {dx+w, dy+fold} };
+    Polygon(dc, ptFold, 3);
+    
+    MoveToEx(dc, dx+w-fold, dy+fold, NULL); LineTo(dc, dx+w, dy+fold);
+    MoveToEx(dc, dx+w-fold, dy+fold, NULL); LineTo(dc, dx+w-fold, dy);
+
+    HPEN pLine = CreatePen(PS_SOLID, s1, RGB(200, 200, 210));
+    SelectObject(dc, pLine);
+    for (int ly = dy + s12; ly < dy + h - s6; ly += s6) {
+        MoveToEx(dc, dx + s6, ly, NULL);
+        int lw = (ly < dy + fold + s3) ? (w - fold - s6 - s3) : (w - s12);
+        LineTo(dc, dx + s6 + lw, ly);
+    }
+
+    SelectObject(dc, oldP); SelectObject(dc, oldB);
+    DeleteObject(bPaper); DeleteObject(pEdge); DeleteObject(bFold); DeleteObject(pLine);
+}
+
+static void DrawGroupIcon(HDC dc, int x, int y, int size) {
+    int w = size, h = (int)(size*0.8f);
+    int dy = y + (size-h)/2;
+    int s1 = max(1, (int)(size*0.02f)), s4 = max(1, (int)(size*0.08f)), s8 = max(1, (int)(size*0.15f)), s12 = max(1, (int)(size*0.2f));
+
+    HPEN pNone = CreatePen(PS_NULL, 0, 0);
+    HBRUSH bShadow = CreateSolidBrush(RGB(180,180,180));
+    HGDIOBJ oldP = SelectObject(dc, pNone);
+    HGDIOBJ oldB = SelectObject(dc, bShadow);
+    RoundRect(dc, x+s4, dy+s4, x+w+s4, dy+h+s4, s8, s8);
+
+    HBRUSH bBase = CreateSolidBrush(RGB(210, 230, 240));
+    HPEN pEdge = CreatePen(PS_SOLID, s1, RGB(80, 100, 120));
+    SelectObject(dc, bBase); SelectObject(dc, pEdge);
+    RoundRect(dc, x, dy, x+w, dy+h, s8, s8);
+
+    HBRUSH bTitle = CreateSolidBrush(RGB(160, 190, 210));
+    SelectObject(dc, bTitle);
+    POINT ptT[] = { {x+s1, dy+s12}, {x+w-s1, dy+s12}, {x+w-s1, dy+s4}, {x+w-s4, dy+s1}, {x+s4, dy+s1}, {x+s1, dy+s4} };
+    Polygon(dc, ptT, 6);
+    MoveToEx(dc, x, dy+s12, NULL); LineTo(dc, x+w, dy+s12);
+
+    HBRUSH bItem = CreateSolidBrush(RGB(255, 255, 255));
+    SelectObject(dc, bItem);
+    int sq = (w - s4*3) / 3;
+    int startX = x + s4 + s1;
+    int startY = dy + s12 + s4;
+    for (int r = 0; r < 2; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            Rectangle(dc, startX + c*(sq+s4), startY + r*(sq+s4), startX + c*(sq+s4) + sq, startY + r*(sq+s4) + sq);
+            MoveToEx(dc, startX + c*(sq+s4) + s1*2, startY + r*(sq+s4) + s4, NULL);
+            LineTo(dc, startX + c*(sq+s4) + sq - s1*2, startY + r*(sq+s4) + s4);
+        }
+    }
+
+    SelectObject(dc, oldP); SelectObject(dc, oldB);
+    DeleteObject(pNone); DeleteObject(bShadow); DeleteObject(bBase); DeleteObject(pEdge);
+    DeleteObject(bTitle); DeleteObject(bItem);
+}
+
+static void DrawTrashIcon(HDC dc, int x, int y, int size, float lidOpenPct) {
+    int w = (int)(size * 0.7f), h = (int)(size * 0.85f);
+    int dx = x + (size - w)/2, dy = y + (size - h)/2;
+    int s1 = max(1, (int)(size*0.02f)), s2 = max(1, (int)(size*0.04f)), s4 = max(1, (int)(size*0.08f));
+    int s6 = max(1, (int)(size*0.1f)), s8 = max(1, (int)(size*0.15f)), s10 = max(1, (int)(size*0.18f));
+    
+    HPEN pNone = CreatePen(PS_NULL, 0, 0);
+    HGDIOBJ oldP = SelectObject(dc, pNone);
+    HBRUSH bShadow = CreateSolidBrush(RGB(180,180,180));
+    HGDIOBJ oldB = SelectObject(dc, bShadow);
+    Ellipse(dc, dx+s4, dy+h-s8, dx+w+s4, dy+h+s4);
+    Rectangle(dc, dx+s4, dy+s10, dx+w+s4, dy+h);
+    
+    HBRUSH bBody = CreateSolidBrush(RGB(210, 215, 220));
+    HPEN pEdge = CreatePen(PS_SOLID, s1, RGB(80, 80, 80));
+    SelectObject(dc, bBody); SelectObject(dc, pEdge);
+    Rectangle(dc, dx, dy+s10, dx+w, dy+h);
+    Ellipse(dc, dx, dy+h-s8, dx+w, dy+h+s8);
+    
+    HPEN pRidge = CreatePen(PS_SOLID, s1, RGB(160, 160, 170));
+    HPEN pHi = CreatePen(PS_SOLID, s1, RGB(240, 245, 250));
+    for (int rx = dx + s6; rx < dx + w - s4; rx += s6) {
+        SelectObject(dc, pRidge);
+        MoveToEx(dc, rx, dy+s10, NULL); LineTo(dc, rx, dy+h+s2);
+        SelectObject(dc, pHi);
+        MoveToEx(dc, rx+s1, dy+s10, NULL); LineTo(dc, rx+s1, dy+h+s2);
+    }
+
+    SelectObject(dc, bBody); SelectObject(dc, pEdge);
+    Ellipse(dc, dx, dy+s4, dx+w, dy+s10+s6);
+    
+    int lidDy = dy - (int)(size * 0.4f * lidOpenPct);
+
+    HBRUSH bLid = CreateSolidBrush(RGB(230, 235, 240));
+    SelectObject(dc, bLid);
+    Ellipse(dc, dx-s2, lidDy-s2, dx+w+s2, lidDy+s8);
+    
+    MoveToEx(dc, dx+w/2-s6, lidDy-s2, NULL);
+    LineTo(dc, dx+w/2-s6, lidDy-s6);
+    LineTo(dc, dx+w/2+s6, lidDy-s6);
+    LineTo(dc, dx+w/2+s6, lidDy-s2);
+
+    SelectObject(dc, oldP); SelectObject(dc, oldB);
+    DeleteObject(pNone); DeleteObject(bShadow); DeleteObject(bBody); DeleteObject(pEdge);
+    DeleteObject(pRidge); DeleteObject(pHi); DeleteObject(bLid);
+}
+
+static void DrawSearchIcon(HDC dc, int x, int y, int size) {
+    int cx = x + size/2 - (int)(size*0.15f);
+    int cy = y + size/2 - (int)(size*0.15f);
+    int r = (int)(size * 0.35f);
+
+    HPEN pHandle = CreatePen(PS_SOLID, max(1, (int)(size*0.15f)), RGB(100, 60, 40));
+    HGDIOBJ oldP = SelectObject(dc, pHandle);
+    MoveToEx(dc, cx + (int)(r * 0.7f), cy + (int)(r * 0.7f), NULL);
+    LineTo(dc, x + size - max(1, (int)(size*0.05f)), y + size - max(1, (int)(size*0.05f)));
+
+    HPEN pEdge = CreatePen(PS_SOLID, max(1, (int)(size*0.08f)), RGB(50, 50, 50));
+    HBRUSH bGlass = CreateSolidBrush(RGB(200, 240, 255));
+    SelectObject(dc, pEdge); SelectObject(dc, bGlass);
+    Ellipse(dc, cx - r, cy - r, cx + r, cy + r);
+
+    HPEN pGlassHi = CreatePen(PS_SOLID, max(1, (int)(size*0.05f)), RGB(255, 255, 255));
+    SelectObject(dc, pGlassHi);
+    int off = max(1, (int)(size*0.1f));
+    Arc(dc, cx - r + off, cy - r + off, cx + r - off, cy + r - off, 
+        cx - r + off, cy, cx, cy - r + off);
+
+    SelectObject(dc, oldP);
+    DeleteObject(pHandle); DeleteObject(pEdge); DeleteObject(bGlass); DeleteObject(pGlassHi);
+}
+
+static void DrawPinstripe(HDC dc, RECT r) {
+    HBRUSH w = (HBRUSH)GetStockObject(WHITE_BRUSH); FillRect(dc, &r, w);
+    HPEN stripe = CreatePen(PS_SOLID, S(1), RGB(180,180,180)); HGDIOBJ old = SelectObject(dc, stripe);
+    for (int y = r.top + S(2); y < r.bottom; y += S(2)) { MoveToEx(dc, r.left, y, NULL); LineTo(dc, r.right, y); }
+    SelectObject(dc, old); DeleteObject(stripe);
+}
+
+static void DrawClassicBezel(HDC dc, RECT r) {
+    HPEN penBlack = CreatePen(PS_SOLID, S(1), RGB(0,0,0)); HPEN penWhite = CreatePen(PS_SOLID, S(1), RGB(255,255,255)); HPEN penGray  = CreatePen(PS_SOLID, S(1), RGB(160,160,160));
+    HGDIOBJ old = SelectObject(dc, penBlack); HBRUSH nullBr = (HBRUSH)GetStockObject(NULL_BRUSH); HGDIOBJ oldBr = SelectObject(dc, nullBr);
+    Rectangle(dc, r.left, r.top, r.right, r.bottom);
+    SelectObject(dc, penWhite); MoveToEx(dc, r.left+S(1), r.bottom-S(2), NULL); LineTo(dc, r.left+S(1), r.top+S(1)); LineTo(dc, r.right-S(2), r.top+S(1));
+    SelectObject(dc, penGray); MoveToEx(dc, r.right-S(2), r.top+S(1), NULL); LineTo(dc, r.right-S(2), r.bottom-S(2)); LineTo(dc, r.left+S(1), r.bottom-S(2));
+    SelectObject(dc, oldBr); SelectObject(dc, old); DeleteObject(penBlack); DeleteObject(penWhite); DeleteObject(penGray);
+}
+
+static void TextOutAlign(HDC dc, int x, int y, const wchar_t* s, UINT align) { UINT old = SetTextAlign(dc, align); TextOutW(dc, x, y, s, lstrlenW(s)); SetTextAlign(dc, old); }
+
+static BOOL FS_IsDotDir(const wchar_t* name) { return (name[0]==L'.' && (name[1]==0 || (name[1]==L'.' && name[2]==0))); }
+
+static ULONGLONG FS_GetFileSizeBytes(const wchar_t* fullPath) {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!fullPath || !*fullPath) return 0;
+    if (GetFileAttributesExW(fullPath, GetFileExInfoStandard, &fad)) { ULARGE_INTEGER li; li.HighPart = fad.nFileSizeHigh; li.LowPart  = fad.nFileSizeLow; return li.QuadPart; }
+    return 0;
+}
+
+static void FS_GetDirSizeRecursive(const wchar_t* dir, ULONGLONG* total) {
+    wchar_t mask[MAX_PATH]; _snwprintf(mask, MAX_PATH-1, L"%s\\*", dir); mask[MAX_PATH-1]=0;
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(mask, &fd); if (h==INVALID_HANDLE_VALUE) return;
+    do {
+        if (FS_IsDotDir(fd.cFileName)) continue;
+        wchar_t full[MAX_PATH]; _snwprintf(full, MAX_PATH-1, L"%s\\%s", dir, fd.cFileName); full[MAX_PATH-1]=0;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) FS_GetDirSizeRecursive(full, total);
+        else { ULARGE_INTEGER li; li.HighPart = fd.nFileSizeHigh; li.LowPart = fd.nFileSizeLow; *total += li.QuadPart; }
+    } while (FindNextFileW(h, &fd)); FindClose(h);
+}
+
+static ULONGLONG FS_GetMultiTotalSize(const wchar_t* multi) {
+    ULONGLONG t = 0;
+    for (const wchar_t* p = multi; *p; p += lstrlenW(p)+1) {
+        DWORD attr = GetFileAttributesW(p);
+        if (attr != INVALID_FILE_ATTRIBUTES) { if (attr & FILE_ATTRIBUTE_DIRECTORY) FS_GetDirSizeRecursive(p, &t); else t += FS_GetFileSizeBytes(p); }
+    } return t;
+}
+
+#define MAX_CONCURRENT_OPS 4
+typedef struct {
+    int slotIdx;
+    int opType; 
+    wchar_t* multiSrc;
+    wchar_t destDir[MAX_PATH];
+    volatile ULONGLONG totalBytes;
+    volatile ULONGLONG bytesTransferred;
+    volatile BOOL isRunning;
+    HWND hProgWnd;
+    void* copyBuffer;
+    DWORD copyBufSize;
+} ProgressData;
+static ProgressData g_progData[MAX_CONCURRENT_OPS] = {0};
+
+static BOOL MyFileCopy(const wchar_t* srcPath, const wchar_t* dstPath, ProgressData* pd) {
+    HANDLE hSrc = CreateFileW(srcPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hSrc == INVALID_HANDLE_VALUE) return FALSE;
+    HANDLE hDst = CreateFileW(dstPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hDst == INVALID_HANDLE_VALUE) { CloseHandle(hSrc); return FALSE; }
+
+    BOOL ok = TRUE; DWORD bytesRead = 0, bytesWritten = 0;
+    void* buffer = pd->copyBuffer;
+    DWORD bufSize = pd->copyBufSize;
+    char stackBuf[8192];
+    if (!buffer) { buffer = stackBuf; bufSize = sizeof(stackBuf); }
+
+    while (pd->isRunning && ReadFile(hSrc, buffer, bufSize, &bytesRead, NULL) && bytesRead > 0) {
+        if (!WriteFile(hDst, buffer, bytesRead, &bytesWritten, NULL) || bytesRead != bytesWritten) { ok = FALSE; break; }
+        pd->bytesTransferred += bytesRead;
+    }
+    CloseHandle(hDst); CloseHandle(hSrc);
+
+    if (!pd->isRunning || !ok) { DeleteFileW(dstPath); return FALSE; }
+    return TRUE;
+}
+
+static void MyRecursiveCopy(const wchar_t* srcPath, const wchar_t* dstPath, ProgressData* pd) {
+    if (!pd->isRunning) return;
+    DWORD attr = GetFileAttributesW(srcPath); if (attr == INVALID_FILE_ATTRIBUTES) return;
+    if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+        CreateDirectoryW(dstPath, NULL);
+        wchar_t mask[MAX_PATH]; _snwprintf(mask, MAX_PATH-1, L"%s\\*", srcPath); mask[MAX_PATH-1]=0;
+        WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(mask, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (FS_IsDotDir(fd.cFileName)) continue;
+                wchar_t newSrc[MAX_PATH], newDst[MAX_PATH];
+                _snwprintf(newSrc, MAX_PATH-1, L"%s\\%s", srcPath, fd.cFileName); _snwprintf(newDst, MAX_PATH-1, L"%s\\%s", dstPath, fd.cFileName);
+                MyRecursiveCopy(newSrc, newDst, pd);
+            } while (FindNextFileW(h, &fd) && pd->isRunning);
+            FindClose(h);
+        }
+    } else { MyFileCopy(srcPath, dstPath, pd); }
+}
+
+static void MyRecursiveDelete(const wchar_t* path, ProgressData* pd) {
+    if (!pd->isRunning) return;
+    DWORD attr = GetFileAttributesW(path); if (attr == INVALID_FILE_ATTRIBUTES) return;
+    if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+        wchar_t mask[MAX_PATH]; _snwprintf(mask, MAX_PATH-1, L"%s\\*", path); mask[MAX_PATH-1]=0;
+        WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(mask, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (FS_IsDotDir(fd.cFileName)) continue;
+                wchar_t child[MAX_PATH]; _snwprintf(child, MAX_PATH-1, L"%s\\%s", path, fd.cFileName);
+                MyRecursiveDelete(child, pd);
+            } while (FindNextFileW(h, &fd) && pd->isRunning);
+            FindClose(h);
+        }
+        SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL); RemoveDirectoryW(path);
+    } else {
+        ULARGE_INTEGER sz; sz.QuadPart = 0; WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) { sz.HighPart = fad.nFileSizeHigh; sz.LowPart = fad.nFileSizeLow; }
+        SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL); DeleteFileW(path);
+        pd->bytesTransferred += sz.QuadPart;
+    }
+}
+
+static void MyRecursiveMove(const wchar_t* srcPath, const wchar_t* dstPath, ProgressData* pd) {
+    if (!pd->isRunning) return;
+    if (MoveFileW(srcPath, dstPath)) { 
+        ULONGLONG sz = 0; DWORD attr = GetFileAttributesW(dstPath);
+        if (attr != INVALID_FILE_ATTRIBUTES) { if (attr & FILE_ATTRIBUTE_DIRECTORY) FS_GetDirSizeRecursive(dstPath, &sz); else sz = FS_GetFileSizeBytes(dstPath); }
+        pd->bytesTransferred += sz;
+    } else {
+        MyRecursiveCopy(srcPath, dstPath, pd);
+        if (pd->isRunning) MyRecursiveDelete(srcPath, pd);
+    }
+}
+
+static void FS_SplitNameExt(const wchar_t* name, wchar_t* base, wchar_t* ext);
+static void FS_PathJoin(wchar_t* out, const wchar_t* dir, const wchar_t* name);
+
+static void FS_UniqueName(wchar_t* out, const wchar_t* dir, const wchar_t* name, BOOL isDir) {
+    wchar_t tryPath[MAX_PATH]; FS_PathJoin(tryPath, dir, name);
+    DWORD attrs = GetFileAttributesW(tryPath); if (attrs == INVALID_FILE_ATTRIBUTES) { lstrcpynW(out, name, MAX_PATH-1); return; }
+    wchar_t base[MAX_PATH], ext[MAX_PATH]; FS_SplitNameExt(name, base, ext);
+    for (int i=2; i<1000; ++i) {
+        wchar_t candidate[MAX_PATH]; if (ext[0]) wsprintfW(candidate, L"%s (%d)%s", base, i, ext); else wsprintfW(candidate, L"%s (%d)", base, i);
+        FS_PathJoin(tryPath, dir, candidate); attrs = GetFileAttributesW(tryPath);
+        if (attrs == INVALID_FILE_ATTRIBUTES) { lstrcpynW(out, candidate, MAX_PATH-1); return; }
+    } lstrcpynW(out, name, MAX_PATH-1);
+}
+
+static DWORD WINAPI FileOpWorker(LPVOID lpParam) {
+    ProgressData* pd = (ProgressData*)lpParam;
+    pd->totalBytes = FS_GetMultiTotalSize(pd->multiSrc);
+    
+    pd->copyBufSize = 8 * 1024 * 1024;
+    pd->copyBuffer = VirtualAlloc(NULL, pd->copyBufSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pd->copyBuffer) { 
+        pd->copyBufSize = 65536; 
+        pd->copyBuffer = VirtualAlloc(NULL, pd->copyBufSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); 
+    }
+
+    for (const wchar_t* p = pd->multiSrc; *p; p += lstrlenW(p)+1) {
+        if (!pd->isRunning) break;
+        if (pd->opType == FO_DELETE) { MyRecursiveDelete(p, pd); } else {
+            const wchar_t* fname = wcsrchr(p, L'\\'); if (fname) fname++; else fname = p;
+            DWORD srcAttr = GetFileAttributesW(p); BOOL isDir = (srcAttr != INVALID_FILE_ATTRIBUTES && (srcAttr & FILE_ATTRIBUTE_DIRECTORY));
+            wchar_t finalName[MAX_PATH]; FS_UniqueName(finalName, pd->destDir, fname, isDir);
+            wchar_t dstPath[MAX_PATH]; FS_PathJoin(dstPath, pd->destDir, finalName);
+            if (pd->opType == FO_COPY) MyRecursiveCopy(p, dstPath, pd); else if (pd->opType == FO_MOVE) MyRecursiveMove(p, dstPath, pd);
+        }
+    }
+    
+    if (pd->copyBuffer) {
+        VirtualFree(pd->copyBuffer, 0, MEM_RELEASE);
+        pd->copyBuffer = NULL;
+    }
+    pd->isRunning = FALSE; return 0;
+}
+
+static LRESULT CALLBACK ProgressProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+    ProgressData* pd = (ProgressData*)GetWindowLongPtrW(w, GWLP_USERDATA);
+    switch(m) {
+        case WM_CREATE: {
+            CREATESTRUCT* cs = (CREATESTRUCT*)lp;
+            pd = (ProgressData*)cs->lpCreateParams;
+            SetWindowLongPtrW(w, GWLP_USERDATA, (LONG_PTR)pd);
+            SetTimer(w, 1, 30, NULL);
+        } return 0;
+        case WM_TIMER: {
+            if (pd && !pd->isRunning) {
+                KillTimer(w, 1); DestroyWindow(w);
+                if (pd->multiSrc) { LocalFree(pd->multiSrc); pd->multiSrc = NULL; }
+                PostMessageW(GetParent(w), WM_APP+2, 0, 0); 
+            } else { InvalidateRect(w, NULL, FALSE); }
+        } return 0;
+        case WM_PAINT: {
+            PAINTSTRUCT ps; HDC dc = BeginPaint(w, &ps); RECT r; GetClientRect(w, &r);
+            HBRUSH bg = CreateSolidBrush(RGB(245,245,245)); FillRect(dc, &r, bg); DeleteObject(bg);
+            DrawClassicBezel(dc, r); RECT titleR = r; titleR.bottom = titleR.top + S(24); DrawPinstripe(dc, titleR);
+
+            HFONT f; PickClassicFont(&f, 13, TRUE); HGDIOBJ of = SelectObject(dc, f); SetBkMode(dc, TRANSPARENT);
+            TextOutAlign(dc, (titleR.left+titleR.right)/2, titleR.top+S(4), L"File Operation", TA_TOP|TA_CENTER);
+            SelectObject(dc, of); DeleteObject(f);
+
+            double pct = 0.0;
+            if (pd && pd->totalBytes > 0) { pct = (double)pd->bytesTransferred / (double)pd->totalBytes; }
+            else { static float bounce = 0.0f; bounce += 0.02f; if(bounce>1.0f) bounce=0; pct = bounce; }
+            if (pct < 0.0) { pct = 0.0; } if (pct > 1.0) { pct = 1.0; }
+
+            RECT barR = { r.left + S(20), titleR.bottom + S(30), r.right - S(20), titleR.bottom + S(50) };
+            HPEN pen = CreatePen(PS_SOLID, S(1), RGB(0,0,0)); HGDIOBJ op = SelectObject(dc, pen);
+            Rectangle(dc, barR.left, barR.top, barR.right, barR.bottom);
+            RECT fillR = barR; InflateRect(&fillR, -S(2), -S(2)); fillR.right = fillR.left + (int)((fillR.right - fillR.left) * pct);
+            HBRUSH bfill = CreateSolidBrush(RGB(100, 150, 255)); FillRect(dc, &fillR, bfill); DeleteObject(bfill);
+
+            wchar_t pctStr[32]; _snwprintf(pctStr, 31, L"%.0f%%", pct * 100.0);
+            PickClassicFont(&f, 12, FALSE); SelectObject(dc, f);
+            TextOutAlign(dc, (barR.left+barR.right)/2, barR.bottom + S(10), pctStr, TA_TOP|TA_CENTER);
+            SelectObject(dc, op); DeleteObject(pen); SelectObject(dc, of); DeleteObject(f); EndPaint(w, &ps);
+        } return 0;
+    }
+    return DefWindowProcW(w,m,wp,lp);
+}
+
+static void StartFileOperation(int opType, const wchar_t* multiSrc, const wchar_t* destDir, HWND hParent) {
+    int slot = -1;
+    for (int i=0; i<MAX_CONCURRENT_OPS; i++) { if (!g_progData[i].isRunning) { slot = i; break; } }
+    if (slot == -1) { MessageBoxW(hParent, L"Max parallel operations (4) reached!", L"Busy", MB_OK); return; }
+
+    ProgressData* pd = &g_progData[slot];
+    pd->opType = opType;
+    
+    size_t srcBytes = 2;
+    for (const wchar_t* p = multiSrc; *p; p += lstrlenW(p)+1) {
+        srcBytes += lstrlenW(p) + 1;
+    }
+    if (pd->multiSrc) { LocalFree(pd->multiSrc); pd->multiSrc = NULL; }
+    pd->multiSrc = (wchar_t*)LocalAlloc(LMEM_FIXED, srcBytes * sizeof(wchar_t));
+    if (pd->multiSrc) memcpy(pd->multiSrc, multiSrc, srcBytes * sizeof(wchar_t));
+
+    if (destDir) lstrcpyW(pd->destDir, destDir); else pd->destDir[0] = 0;
+    pd->totalBytes = 0; pd->bytesTransferred = 0; pd->isRunning = TRUE; pd->slotIdx = slot;
+    
+    CreateThread(NULL, 0, FileOpWorker, pd, 0, NULL);
+    
+    RECT wr; GetWindowRect(hParent, &wr);
+    pd->hProgWnd = CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST, kProgClass, L"", WS_POPUP, wr.left + S(100) + slot*S(30), wr.top + S(150) + slot*S(30), S(320), S(110), hParent, NULL, g_hInst, pd);
+    ShowWindow(pd->hProgWnd, SW_SHOWNOACTIVATE); UpdateWindow(pd->hProgWnd);
+}
+
+static BOOL DoPasteIntoDirViaProgress(HWND owner, const wchar_t* destDir, const wchar_t* textMulti, BOOL isMove) {
+    if (!destDir || !*destDir || !textMulti || !*textMulti) return FALSE;
+    int maxLines = 16384;
+    wchar_t** arr = (wchar_t**)LocalAlloc(LMEM_FIXED, maxLines * sizeof(wchar_t*));
+    if (!arr) return FALSE;
+    int n = SplitLinesToArray(textMulti, arr, maxLines);
+    if (n<=0) { LocalFree(arr); return FALSE; }
+    wchar_t* multi = BuildDoubleNullMultiString(arr, n);
+    if (!multi) { FreeArray(arr, n); LocalFree(arr); return FALSE; }
+    StartFileOperation(isMove ? FO_MOVE : FO_COPY, multi, destDir, owner);
+    LocalFree(multi); FreeArray(arr, n); LocalFree(arr); return TRUE;
+}
+
+typedef enum { IT_FOLDER, IT_FILE, IT_TRASH, IT_GROUP } ItemType;
+typedef struct { ItemType type; wchar_t name[64]; wchar_t desc[128]; int gridCol, gridRow; BOOL selected; int parent; wchar_t path[MAX_PATH]; BOOL fromFS; BOOL scanned; ULONGLONG lastWriteTime; ULONGLONG sizeCache; } Item;
+
+#define MAX_ITEMS 16384
+static Item g_items[MAX_ITEMS];
+static int  g_itemCount = 0;
+static BOOL  g_ttVisible = FALSE;
+static int   g_ttItem    = -1;
+static POINT g_ttPos     = {0,0};
+static int  g_trashIndex = -1;
+static wchar_t g_fsRootPath[MAX_PATH] = L"";
+
+typedef struct { BOOL isAdvanced; wchar_t pattern[128]; BOOL hasSizeFilter; int sizeSign; ULONGLONG sizeLimit; BOOL isTop; int topCount; int topSort; } SearchQuery;
+typedef struct { wchar_t name[MAX_PATH]; wchar_t path[MAX_PATH]; ULONGLONG size; BOOL isDir; } SearchResultItem;
+typedef struct { SearchQuery sq; wchar_t startDir[MAX_PATH]; HWND hwndNotify; volatile BOOL* pRunningFlag; } SearchTask;
+
+static volatile BOOL g_isSearchRunning = FALSE;
+static int g_topSortDir = -1;
+
+static void ParseQuery(const wchar_t* q, SearchQuery* sq) {
+    memset(sq, 0, sizeof(SearchQuery)); lstrcpyW(sq->pattern, L"*"); 
+    sq->topSort = -1;
+    
+    wchar_t lq[512]; lstrcpynW(lq, q, 511); CharLowerW(lq);
+    const wchar_t* pFindAll = wcsstr(lq, L"-findall"); if (!pFindAll) pFindAll = wcsstr(lq, L"findall");
+    if (pFindAll) {
+        sq->isAdvanced = TRUE; pFindAll += (pFindAll[0] == L'-') ? 8 : 7; while (*pFindAll == L' ' || *pFindAll == L'(') pFindAll++;
+        int i = 0; while (*pFindAll && *pFindAll != L' ' && *pFindAll != L')' && i < 126) { sq->pattern[i++] = (*pFindAll == L'@') ? L'*' : q[pFindAll - lq]; pFindAll++; }
+        sq->pattern[i] = 0; if (i == 0) lstrcpyW(sq->pattern, L"*");
+    }
+    const wchar_t* pTop = wcsstr(lq, L"-top"); if (!pTop) pTop = wcsstr(lq, L"top");
+    if (pTop) {
+        sq->isAdvanced = TRUE; sq->isTop = TRUE; pTop += (pTop[0] == L'-') ? 4 : 3; while (*pTop == L' ') pTop++;
+        sq->topCount = _wtoi(pTop); while (*pTop >= L'0' && *pTop <= L'9') pTop++; while (*pTop == L' ') pTop++;
+        if (*pTop == L'h') sq->topSort = -1; else if (*pTop == L's') sq->topSort = 1;
+    }
+    for (const wchar_t* p = lq; *p; p++) {
+        if ((*p == L'+' || *p == L'-') && p[1] >= L'0' && p[1] <= L'9') {
+            sq->isAdvanced = TRUE; sq->hasSizeFilter = TRUE; sq->sizeSign = (*p == L'+') ? 1 : -1; p++; ULONGLONG val = 0;
+            while (*p >= L'0' && *p <= L'9') { val = val * 10 + (*p - L'0'); p++; } while (*p == L' ') p++;
+            if (wcsncmp(p, L"gb", 2) == 0) val *= 1024ULL * 1024ULL * 1024ULL; else if (wcsncmp(p, L"mb", 2) == 0) val *= 1024ULL * 1024ULL; else if (wcsncmp(p, L"kb", 2) == 0) val *= 1024ULL;
+            sq->sizeLimit = val; break;
+        }
+    }
+    if (!sq->isAdvanced) { int i = 0; for (; q[i] && i < 126; i++) sq->pattern[i] = (q[i] == L'@') ? L'*' : q[i]; sq->pattern[i] = 0; }
+}
+
+static int CompareSearchItems(const void* a, const void* b) {
+    SearchResultItem* itemA = (SearchResultItem*)a; SearchResultItem* itemB = (SearchResultItem*)b;
+    if (itemA->size < itemB->size) return (g_topSortDir == 1) ? -1 : 1;
+    if (itemA->size > itemB->size) return (g_topSortDir == 1) ? 1 : -1;
+    return 0;
+}
+
+static void RecursiveSearchWorker(const wchar_t* dir, SearchTask* task, SearchResultItem* pResults, int* pCount) {
+    if (!*(task->pRunningFlag)) return;
+    wchar_t mask[MAX_PATH]; if (dir[lstrlenW(dir)-1] == L'\\') _snwprintf(mask, MAX_PATH-1, L"%s*", dir); else _snwprintf(mask, MAX_PATH-1, L"%s\\*", dir);
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(mask, &fd); if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (lstrcmpW(fd.cFileName, L".") == 0 || lstrcmpW(fd.cFileName, L"..") == 0) continue;
+        wchar_t full[MAX_PATH]; if (dir[lstrlenW(dir)-1] == L'\\') _snwprintf(full, MAX_PATH-1, L"%s%s", dir, fd.cFileName); else _snwprintf(full, MAX_PATH-1, L"%s\\%s", dir, fd.cFileName);
+        BOOL isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0; BOOL match = TRUE;
+        if (task->sq.pattern[0] && lstrcmpW(task->sq.pattern, L"*") != 0) { if (!PathMatchSpecW(fd.cFileName, task->sq.pattern)) match = FALSE; }
+        ULONGLONG sz = 0; if (!isDir) { ULARGE_INTEGER li; li.HighPart = fd.nFileSizeHigh; li.LowPart = fd.nFileSizeLow; sz = li.QuadPart; }
+        if (match && task->sq.hasSizeFilter && !isDir) { if (task->sq.sizeSign > 0 && sz <= task->sq.sizeLimit) match = FALSE; if (task->sq.sizeSign < 0 && sz >= task->sq.sizeLimit) match = FALSE; }
+        if (match && (!isDir || !task->sq.hasSizeFilter)) {
+            if (*pCount < 16000) {
+                pResults[*pCount].size = sz; pResults[*pCount].isDir = isDir; lstrcpynW(pResults[*pCount].name, fd.cFileName, MAX_PATH); lstrcpynW(pResults[*pCount].path, full, MAX_PATH); (*pCount)++;
+            } else {
+                if (task->sq.isTop) {
+                    g_topSortDir = task->sq.topSort; qsort(pResults, *pCount, sizeof(SearchResultItem), CompareSearchItems);
+                    int keep = (task->sq.topCount > 0 && task->sq.topCount < 8000) ? task->sq.topCount : 1000; *pCount = keep;
+                    pResults[*pCount].size = sz; pResults[*pCount].isDir = isDir; lstrcpynW(pResults[*pCount].name, fd.cFileName, MAX_PATH); lstrcpynW(pResults[*pCount].path, full, MAX_PATH); (*pCount)++;
+                } else { FindClose(h); return; }
+            }
+        }
+        if (isDir) RecursiveSearchWorker(full, task, pResults, pCount);
+    } while (FindNextFileW(h, &fd) && *(task->pRunningFlag));
+    FindClose(h);
+}
+
+static DWORD WINAPI SearchThread(LPVOID lpParam) {
+    SearchTask* task = (SearchTask*)lpParam;
+    SearchResultItem* pResults = (SearchResultItem*)LocalAlloc(LMEM_FIXED, 16384 * sizeof(SearchResultItem));
+    int count = 0;
+    if (lstrcmpW(task->startDir, L"ALL") == 0) {
+        wchar_t drives[256]; DWORD r = GetLogicalDriveStringsW(255, drives);
+        if (r > 0) {
+            wchar_t* p = drives;
+            while (*p && *(task->pRunningFlag)) {
+                wchar_t rootDir[16]; lstrcpynW(rootDir, p, 15); UINT type = GetDriveTypeW(rootDir);
+                if (type == DRIVE_FIXED || type == DRIVE_REMOVABLE || type == DRIVE_RAMDISK) { RecursiveSearchWorker(rootDir, task, pResults, &count); }
+                p += lstrlenW(p) + 1;
+            }
+        }
+    } else { RecursiveSearchWorker(task->startDir, task, pResults, &count); }
+
+    if (task->sq.isTop && count > 0) { g_topSortDir = task->sq.topSort; qsort(pResults, count, sizeof(SearchResultItem), CompareSearchItems); if (task->sq.topCount > 0 && count > task->sq.topCount) { count = task->sq.topCount; } }
+    PostMessageW(task->hwndNotify, WM_APP+5, (WPARAM)pResults, (LPARAM)count); LocalFree(task); return 0;
+}
+
+static BOOL GetDesktopPath(wchar_t* outPath) {
+    PWSTR p = NULL; HRESULT hr = SHGetKnownFolderPath(&FOLDERID_Desktop, 0, NULL, &p);
+    if (SUCCEEDED(hr) && p) { lstrcpynW(outPath, p, MAX_PATH-1); CoTaskMemFree(p); return TRUE; }
+    wchar_t up[MAX_PATH]; DWORD n = GetEnvironmentVariableW(L"USERPROFILE", up, MAX_PATH);
+    if (n>0 && n<MAX_PATH) { lstrcpynW(outPath, up, MAX_PATH-1); if (outPath[lstrlenW(outPath)-1] != L'\\') lstrcatW(outPath, L"\\Desktop"); else lstrcatW(outPath, L"Desktop"); return TRUE; }
+    lstrcpynW(outPath, L"C:\\", MAX_PATH-1); return FALSE;
+}
+
+static void FS_SplitNameExt(const wchar_t* name, wchar_t* base, wchar_t* ext) { const wchar_t* dot = wcsrchr(name, L'.'); if (dot && dot != name) { lstrcpynW(base, name, (int)(dot - name) + 1); lstrcpyW(ext, dot); } else { lstrcpynW(base, name, MAX_PATH-1); ext[0]=0; } }
+static void FS_PathJoin(wchar_t* out, const wchar_t* dir, const wchar_t* name) { lstrcpynW(out, dir, MAX_PATH-1); size_t n = wcslen(out); if (n>0 && out[n-1] != L'\\') lstrcatW(out, L"\\"); lstrcatW(out, name); }
+
+static BOOL FS_CreateFolder(const wchar_t* dir, const wchar_t* name, wchar_t* outFull) {
+    wchar_t finalName[MAX_PATH]; FS_UniqueName(finalName, dir, name, TRUE); wchar_t full[MAX_PATH]; FS_PathJoin(full, dir, finalName);
+    if (CreateDirectoryW(full, NULL)) { if (outFull) lstrcpynW(outFull, full, MAX_PATH-1); return TRUE; } return FALSE;
+}
+
+static BOOL FS_CreateEmptyFile(const wchar_t* dir, const wchar_t* name, wchar_t* outFull) {
+    wchar_t finalName[MAX_PATH]; FS_UniqueName(finalName, dir, name, FALSE); wchar_t full[MAX_PATH]; FS_PathJoin(full, dir, finalName);
+    HANDLE h = CreateFileW(full, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); if (outFull) lstrcpynW(outFull, full, MAX_PATH-1); return TRUE; } return FALSE;
+}
+
+typedef struct { RECT client, outer, annex, titleBar, content, closeBox, growBox; RECT scrollRect; int colW, rowH, iconSize, xStart, yStart, labelH; } Layout;
+typedef struct {
+    int rootId; BOOL delActive; int delStep; BOOL openActive; RECT openRect; int openStep; 
+    BOOL renActive; int renIndex; HWND renEdit; HFONT renFont; BOOL lasso; RECT lassoRect;
+    BOOL dragging; int dragIdx; POINT dragAt; POINT dragOff; BOOL moveAnimActive; int moveDstIdx; float moveStep; POINT moveStartPt;
+    int scrollY; int maxScroll; BOOL scrollDragging; int scrollDragStartMouseY; int scrollDragStartOffY;
+    BOOL copyActive; int copyStep; BOOL pasteActive; int pasteStep; BOOL elevAnimActive; int elevTargetDepth; float elevCurY; HANDLE hDirMonitor;
+} WindowCtx;
+
+static WindowCtx* Ctx(HWND h) { return (WindowCtx*)GetWindowLongPtrW(h, GWLP_USERDATA); }
+static void FS_ClearChildren(int parentId); static void FS_PopulateRootFromPath(const wchar_t* dir, const Layout* L); static void SetupDirectoryMonitor(HWND h, WindowCtx* c, const wchar_t* path);
+
+static wchar_t g_navHistory[10][MAX_PATH];
+static int g_navDepth = 0; 
+
+static HWND g_appleWnd = NULL;
+
+static BOOL CALLBACK EnumWindowsMinimize(HWND w, LPARAM lp) { wchar_t cls[64]; GetClassNameW(w, cls, 63); if (lstrcmpW(cls, kWndClass) == 0) { ShowWindow(w, SW_MINIMIZE); } return TRUE; }
+
+static void DrawRainbowApple(HDC dc, RECT r) {
+    const char* apple24[24] = { "           ...          ", "          .....         ", "         .....          ", "          ...           ", "                        ", "       ..........       ", "     ..GGGGGGGGGG..     ", "    .GGGGGGGGGGGG..     ", "   .GGGGGGGGGGGGGG..    ", "  .YYYYYYYYYYYYYYYY.    ", "  .YYYYYYYYYYYYYYY..    ", "  .OOOOOOOOOOOO.......  ", "  .OOOOOOOOOOO......... ", "  .RRRRRRRRRR.......... ", "   .RRRRRRRRR.........  ", "   .PPPPPPPPPP.......   ", "    .PPPPPPPPPPPPP..    ", "    .BBBBBBBBBBBB..     ", "     .BBBBBBBBBB..      ", "      ..BBBBBB...       ", "        .......         ", "                        ", "                        ", "                        " };
+    int w = r.right - r.left, h = r.bottom - r.top; float pxW = w / 24.0f, pxH = h / 24.0f;
+    HBRUSH bG = CreateSolidBrush(RGB(97, 187, 70)); HBRUSH bY = CreateSolidBrush(RGB(253, 184, 39)); HBRUSH bO = CreateSolidBrush(RGB(245, 130, 31)); HBRUSH bR = CreateSolidBrush(RGB(224, 58, 62)); HBRUSH bP = CreateSolidBrush(RGB(150, 61, 151)); HBRUSH bB = CreateSolidBrush(RGB(0, 157, 220)); HBRUSH bBlk = CreateSolidBrush(RGB(0, 0, 0));
+    for (int y=0; y<24; y++) {
+        for (int x=0; x<24; x++) {
+            char c = apple24[y][x]; if (c == ' ') continue;
+            HBRUSH br = bBlk; if (c == 'G') br = bG; else if (c == 'Y') br = bY; else if (c == 'O') br = bO; else if (c == 'R') br = bR; else if (c == 'P') br = bP; else if (c == 'B') br = bB;
+            RECT pr = { r.left + (int)(x*pxW), r.top + (int)(y*pxH), r.left + (int)((x+1)*pxW) + 1, r.top + (int)((y+1)*pxH) + 1 }; FillRect(dc, &pr, br);
+        }
+    } DeleteObject(bG); DeleteObject(bY); DeleteObject(bO); DeleteObject(bR); DeleteObject(bP); DeleteObject(bB); DeleteObject(bBlk);
+}
+
+static LRESULT CALLBACK AppleProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+    switch(m) {
+        case WM_LBUTTONDOWN: EnumWindows(EnumWindowsMinimize, 0); return 0;
+        case WM_RBUTTONDOWN: { RECT wr; GetWindowRect(w, &wr); HWND popup = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW, kApplePopupClass, L"", WS_POPUP, wr.left, wr.bottom + S(4), S(180), S(144), w, NULL, g_hInst, NULL); ShowWindow(popup, SW_SHOWNOACTIVATE); } return 0;
+        case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(w, &ps); RECT r; GetClientRect(w, &r); HBRUSH bg = CreateSolidBrush(RGB(245,245,245)); FillRect(dc, &r, bg); DeleteObject(bg); DrawClassicBezel(dc, r); RECT ar = r; InflateRect(&ar, -S(10), -S(10)); DrawRainbowApple(dc, ar); EndPaint(w, &ps); } return 0;
+    } return DefWindowProc(w, m, wp, lp);
+}
+
+static LRESULT CALLBACK ApplePopupProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+    switch(m) {
+        case WM_CREATE: {
+            int bw = S(160), bh = S(32), pad = S(10);
+            HWND b1 = CreateWindowExW(0, L"BUTTON", L"Control Panel", WS_CHILD|WS_VISIBLE|BS_OWNERDRAW, pad, pad, bw, bh, w, (HMENU)1, g_hInst, NULL);
+            HWND b2 = CreateWindowExW(0, L"BUTTON", L"Settings", WS_CHILD|WS_VISIBLE|BS_OWNERDRAW, pad, pad+bh+S(8), bw, bh, w, (HMENU)2, g_hInst, NULL);
+            HWND b3 = CreateWindowExW(0, L"BUTTON", L"Run...", WS_CHILD|WS_VISIBLE|BS_OWNERDRAW, pad, pad+bh*2+S(16), bw, bh, w, (HMENU)3, g_hInst, NULL);
+            HFONT f; PickClassicFont(&f, 14, TRUE); SendMessage(b1, WM_SETFONT, (WPARAM)f, TRUE); SendMessage(b2, WM_SETFONT, (WPARAM)f, TRUE); SendMessage(b3, WM_SETFONT, (WPARAM)f, TRUE); SetWindowLongPtrW(w, GWLP_USERDATA, (LONG_PTR)f);
+        } return 0;
+        case WM_ACTIVATE: if (LOWORD(wp) == WA_INACTIVE) DestroyWindow(w); return 0;
+        case WM_DRAWITEM: {
+            LPDRAWITEMSTRUCT di = (LPDRAWITEMSTRUCT)lp; HDC dc = di->hDC; RECT r = di->rcItem;
+            HBRUSH bg = CreateSolidBrush(RGB(255,255,255)); FillRect(dc, &r, bg); DeleteObject(bg); DrawClassicBezel(dc, r);
+            if (di->itemState & ODS_SELECTED) InvertRect(dc, &r);
+            wchar_t txt[64]; GetWindowTextW(di->hwndItem, txt, 63); HFONT f = (HFONT)GetWindowLongPtrW(w, GWLP_USERDATA); HGDIOBJ of = SelectObject(dc, f);
+            SetBkMode(dc, TRANSPARENT); SetTextColor(dc, (di->itemState & ODS_SELECTED) ? RGB(255,255,255) : RGB(0,0,0)); DrawTextW(dc, txt, -1, &r, DT_CENTER|DT_VCENTER|DT_SINGLELINE); SelectObject(dc, of); return TRUE;
+        }
+       case WM_COMMAND: {
+            int cmd = LOWORD(wp); 
+            if (cmd == 1) ShellExecuteW(NULL, L"open", L"control", NULL, NULL, SW_SHOWNORMAL); 
+            if (cmd == 2) ShellExecuteW(NULL, L"open", L"ms-settings:", NULL, NULL, SW_SHOWNORMAL);
+            if (cmd == 3) ShellExecuteW(NULL, L"open", L"explorer.exe", L"shell:::{2559a1f3-21d7-11d4-bdaf-00c04f60b9f0}", NULL, SW_SHOWNORMAL); 
+            DestroyWindow(w);
+        } return 0;
+        case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(w, &ps); RECT r; GetClientRect(w, &r); HBRUSH bg = CreateSolidBrush(RGB(240,240,240)); FillRect(dc, &r, bg); DeleteObject(bg); DrawClassicBezel(dc, r); EndPaint(w, &ps); } return 0;
+        case WM_DESTROY: { HFONT f = (HFONT)GetWindowLongPtrW(w, GWLP_USERDATA); if (f) DeleteObject(f); } return 0;
+    } return DefWindowProc(w, m, wp, lp);
+}
+
+static HWND g_topBar = NULL;
+static RECT g_topBarTrash = {0};
+static RECT g_topBarPlus = {0};
+static HWND g_tbSearchEdit = NULL;
+static HWND g_tbSearchBtn  = NULL;
+static HWND g_tbMultiBtn   = NULL;
+static HWND g_tbStarBtn    = NULL;
+
+#define TB_EDIT_ID 200
+#define TB_BTN_ID  201
+#define TB_MULTI_BTN_ID 202
+#define TB_STAR_BTN_ID 203
+
+static BOOL TopBar_PointInTrash(POINT scrPt) {
+    if (!g_topBar) return FALSE; 
+    RECT wr; GetWindowRect(g_topBar, &wr); RECT r = g_topBarTrash; OffsetRect(&r, wr.left, wr.top); return (scrPt.x>=r.left && scrPt.x<r.right && scrPt.y>=r.top && scrPt.y<r.bottom);
+}
+
+static BOOL CALLBACK EnumWindowsPostSearch(HWND w, LPARAM lp) { wchar_t cls[64]; GetClassNameW(w, cls, 63); if (lstrcmpW(cls, kWndClass)==0) { PostMessageW(w, WM_APP+1, 0, lp); } return TRUE; }
+static BOOL CALLBACK EnumWindowsPostRedraw(HWND w, LPARAM lp) { wchar_t cls[64]; GetClassNameW(w, cls, 63); if (lstrcmpW(cls, kWndClass)==0) { InvalidateRect(w, NULL, FALSE); } return TRUE; }
+static void BroadcastRedraw(void) { EnumWindows(EnumWindowsPostRedraw, 0); }
+static void BroadcastSearch(void) { EnumWindows(EnumWindowsPostSearch, 0); }
+
+static void TopBarLayout(HWND w) {
+    RECT r; GetClientRect(w, &r); int pad=S(20); int sz=S(80); 
+    g_topBarTrash.left = pad; g_topBarTrash.top = S(28); g_topBarTrash.right = g_topBarTrash.left + sz; g_topBarTrash.bottom= g_topBarTrash.top + sz;
+
+    int editW = S(340), editH = S(28); int editLeft = g_topBarTrash.right + S(30); int editTop  = g_topBarTrash.top + (sz - editH)/2;
+    if (g_tbSearchEdit) MoveWindow(g_tbSearchEdit, editLeft, editTop, editW, editH, TRUE);
+    int btnSize = editH + S(4); int btnLeft = editLeft + editW + S(8); int btnTop  = editTop - S(2);
+    if (g_tbSearchBtn)  MoveWindow(g_tbSearchBtn, btnLeft, btnTop, btnSize, btnSize, TRUE);
+    int multiBtnLeft = btnLeft + btnSize + S(8);
+    if (g_tbMultiBtn) MoveWindow(g_tbMultiBtn, multiBtnLeft, btnTop, btnSize, btnSize, TRUE);
+    int starBtnLeft = multiBtnLeft + btnSize + S(8);
+    if (g_tbStarBtn) MoveWindow(g_tbStarBtn, starBtnLeft, btnTop, btnSize, btnSize, TRUE);
+
+    int plusSz = S(32);
+    g_topBarPlus.right = r.right - pad; g_topBarPlus.left = g_topBarPlus.right - plusSz;
+    g_topBarPlus.top = g_topBarTrash.top + (sz - plusSz)/2; g_topBarPlus.bottom = g_topBarPlus.top + plusSz;
+}
+
+static void ShowFavoritesMenu(HWND h);
+
+static LRESULT CALLBACK TopBarProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+    static BOOL dragging = FALSE; static POINT dragOff = {0,0};
+    switch (m) {
+        case WM_CREATE: {
+            HFONT fE; PickClassicFont(&fE, 16, FALSE);
+            g_tbSearchEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 0,0,0,0, w, (HMENU)TB_EDIT_ID, g_hInst, NULL);
+            SendMessageW(g_tbSearchEdit, WM_SETFONT, (WPARAM)fE, TRUE);
+            g_tbSearchBtn  = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD|WS_VISIBLE|BS_OWNERDRAW, 0,0,0,0, w, (HMENU)TB_BTN_ID, g_hInst, NULL);
+            g_tbMultiBtn = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD|WS_VISIBLE|BS_OWNERDRAW, 0,0,0,0, w, (HMENU)TB_MULTI_BTN_ID, g_hInst, NULL);
+            g_tbStarBtn = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD|WS_VISIBLE|BS_OWNERDRAW, 0,0,0,0, w, (HMENU)TB_STAR_BTN_ID, g_hInst, NULL);
+            TopBarLayout(w);
+        } return 0;
+        case WM_SIZE: TopBarLayout(w); return 0;
+        case WM_APP+10: {
+            g_tbTrashAnim = 1;
+            SetTimer(w, 5, 16, NULL);
+        } return 0;
+        case WM_TIMER: {
+            if (wp == 5) {
+                g_tbTrashAnim++;
+                if (g_tbTrashAnim > 25) {
+                    g_tbTrashAnim = 0;
+                    KillTimer(w, 5);
+                }
+                RECT r = g_topBarTrash;
+                InflateRect(&r, S(20), S(20)); 
+                InvalidateRect(w, &r, FALSE);
+            }
+        } return 0;
+        case WM_DRAWITEM: {
+            LPDRAWITEMSTRUCT di = (LPDRAWITEMSTRUCT)lp;
+            if (di->CtlID==TB_BTN_ID) {
+                FillRect(di->hDC, &di->rcItem, (HBRUSH)GetStockObject(WHITE_BRUSH)); DrawClassicBezel(di->hDC, di->rcItem);
+                int s = min(di->rcItem.right-di->rcItem.left, di->rcItem.bottom-di->rcItem.top)-S(14);
+                int cx = (di->rcItem.left+di->rcItem.right-s)/2; int cy = (di->rcItem.top+di->rcItem.bottom-s)/2;
+                DrawSearchIcon(di->hDC, cx, cy, s); return TRUE;
+            } else if (di->CtlID==TB_MULTI_BTN_ID) {
+                FillRect(di->hDC, &di->rcItem, (HBRUSH)GetStockObject(WHITE_BRUSH)); DrawClassicBezel(di->hDC, di->rcItem);
+                int s = S(14); int cx = (di->rcItem.left+di->rcItem.right)/2; int cy = (di->rcItem.top+di->rcItem.bottom)/2; RECT chk = { cx - s/2, cy - s/2, cx + s/2, cy + s/2 };
+                HPEN pen = CreatePen(PS_SOLID, S(1), RGB(0,0,0)); HGDIOBJ oldP = SelectObject(di->hDC, pen); Rectangle(di->hDC, chk.left, chk.top, chk.right, chk.bottom);
+                if (g_multiSelectMode) { MoveToEx(di->hDC, chk.left+S(2), chk.top+S(7), NULL); LineTo(di->hDC, chk.left+S(6), chk.bottom-S(3)); LineTo(di->hDC, chk.right-S(2), chk.top+S(2)); }
+                SelectObject(di->hDC, oldP); DeleteObject(pen); return TRUE;
+            } else if (di->CtlID==TB_STAR_BTN_ID) {
+                FillRect(di->hDC, &di->rcItem, (HBRUSH)GetStockObject(WHITE_BRUSH)); DrawClassicBezel(di->hDC, di->rcItem);
+                HFONT f; PickClassicFont(&f, 20, TRUE); HGDIOBJ of = SelectObject(di->hDC, f); SetBkMode(di->hDC, TRANSPARENT);
+                DrawTextW(di->hDC, L"★", -1, &di->rcItem, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+                SelectObject(di->hDC, of); DeleteObject(f); return TRUE;
+            }
+        } return 0;
+        case WM_COMMAND: { if (LOWORD(wp)==TB_BTN_ID) { BroadcastSearch(); return 0; } else if (LOWORD(wp)==TB_MULTI_BTN_ID) { g_multiSelectMode = !g_multiSelectMode; InvalidateRect(w, NULL, FALSE); BroadcastRedraw(); return 0; } else if (LOWORD(wp)==TB_STAR_BTN_ID) { ShowFavoritesMenu(w); return 0; } } return 0;
+        case WM_KEYDOWN: if (wp==VK_RETURN) { BroadcastSearch(); return 0; } return 0;
+        case WM_LBUTTONDOWN: { SetCapture(w); POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; ClientToScreen(w,&pt); RECT wr; GetWindowRect(w,&wr); dragOff.x = pt.x - wr.left; dragOff.y = pt.y - wr.top; dragging = TRUE; } return 0;
+        case WM_MOUSEMOVE: if (dragging) { POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; ClientToScreen(w, &pt); SetWindowPos(w, HWND_TOPMOST, pt.x - dragOff.x, pt.y - dragOff.y, 0,0, SWP_NOSIZE); } return 0;
+        case WM_LBUTTONUP: {
+            ReleaseCapture(); dragging = FALSE; POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; 
+            if (PtIn(&g_topBarPlus, pt.x, pt.y)) { 
+                int W = S(760), H = S(500);
+                int sx_main = GetSystemMetrics(SM_CXSCREEN);
+                int sy_main = GetSystemMetrics(SM_CYSCREEN);
+                int wx = (sx_main - W) / 2 + (g_windowCount * 20);
+                int wy = (sy_main - H) / 2 + (g_windowCount * 20);
+                HWND win = CreateWindowW(kWndClass, L"", WS_POPUP, wx, wy, W, H, NULL, NULL, g_hInst, NULL);
+                if (win) { ShowWindow(win, SW_SHOWDEFAULT); UpdateWindow(win); }
+            }
+        } return 0;
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps; HDC dc = BeginPaint(w, &ps); RECT r; GetClientRect(w, &r); HBRUSH white=(HBRUSH)GetStockObject(WHITE_BRUSH); FillRect(dc,&r,white); DrawClassicBezel(dc, r);
+            RECT title = r; title.bottom = title.top + S(40); DrawPinstripe(dc, title); 
+            
+            float lidPct = 0.0f;
+            if (g_tbTrashAnim > 0) {
+                if (g_tbTrashAnim <= 10) lidPct = g_tbTrashAnim / 10.0f;
+                else if (g_tbTrashAnim <= 20) lidPct = 1.0f;
+                else lidPct = (25 - g_tbTrashAnim) / 5.0f;
+            }
+            DrawTrashIcon(dc, g_topBarTrash.left, g_topBarTrash.top, g_topBarTrash.right - g_topBarTrash.left, lidPct);
+            
+            DrawClassicBezel(dc, g_topBarPlus);
+            HPEN pen = CreatePen(PS_SOLID, S(2), RGB(0,0,0)); HGDIOBJ oldP = SelectObject(dc, pen);
+            int cx = (g_topBarPlus.left + g_topBarPlus.right)/2; int cy = (g_topBarPlus.top + g_topBarPlus.bottom)/2; int sz = S(8);
+            MoveToEx(dc, cx - sz, cy, NULL); LineTo(dc, cx + sz, cy); MoveToEx(dc, cx, cy - sz, NULL); LineTo(dc, cx, cy + sz);
+            SelectObject(dc, oldP); DeleteObject(pen);
+
+            EndPaint(w, &ps);
+        } return 0;
+    } return DefWindowProcW(w,m,wp,lp);
+}
+
+static void ComputeLayout(HWND h, Layout* L) {
+    GetClientRect(h, &L->client); L->outer = L->client; L->titleBar = L->outer; L->titleBar.bottom = L->titleBar.top + S(28);
+    L->annex = L->outer; L->annex.top = L->titleBar.bottom; L->annex.right = L->annex.left + S(48); 
+    L->content  = L->outer; L->content.top = L->titleBar.bottom + S(4); L->content.left = L->annex.right + S(4);
+    int cb = S(12); L->closeBox.left   = L->titleBar.left + S(8); L->closeBox.top    = L->titleBar.top + ( ( (L->titleBar.bottom - L->titleBar.top) - cb ) / 2 );
+    L->closeBox.right  = L->closeBox.left + cb; L->closeBox.bottom = L->closeBox.top + cb;
+    int gb = S(16); L->growBox.right  = L->content.right - S(6); L->growBox.bottom = L->content.bottom - S(6);
+    L->growBox.left   = L->growBox.right - gb; L->growBox.top    = L->growBox.bottom - gb;
+    L->scrollRect.right = L->content.right; L->scrollRect.left  = L->content.right - S(16);
+    L->scrollRect.top   = L->content.top; L->scrollRect.bottom= L->growBox.top; L->content.right -= S(16); 
+    L->iconSize = S( (int)(56 * g_iconScale) ); L->labelH   = S(18); L->colW     = S( (int)(140 * g_iconScale) );
+    L->rowH     = L->iconSize + S(8) + L->labelH + S(30); L->xStart   = S(16); L->yStart   = S(10) + L->labelH + S(8);
+}
+
+static void UpdateScrollBounds(WindowCtx* c, const Layout* L) {
+    int maxR = 0; for (int i=0;i<g_itemCount;++i) { if (g_items[i].parent == c->rootId && g_items[i].type != IT_TRASH) { if (g_items[i].gridRow > maxR) maxR = g_items[i].gridRow; } }
+    int contentH = L->yStart + (maxR + 1) * L->rowH; int viewH = L->content.bottom - L->content.top;
+    c->maxScroll = max(0, contentH - viewH + S(30)); if (c->scrollY > c->maxScroll) { c->scrollY = c->maxScroll; } if (c->scrollY < 0) { c->scrollY = 0; }
+}
+
+static void DrawStatusLine(HDC dc, const Layout* L, WindowCtx* c) {
+    HPEN pen = CreatePen(PS_SOLID, S(1), RGB(0,0,0)); HGDIOBJ oldPen = SelectObject(dc, pen);
+    MoveToEx(dc, L->content.left, L->content.top, NULL); LineTo(dc, L->content.right, L->content.top); SelectObject(dc, oldPen); DeleteObject(pen);
+
+    HFONT font = NULL; PickClassicFont(&font, 12, FALSE); HGDIOBJ old = SelectObject(dc, font);
+    RECT seg = L->content; seg.top += S(2); seg.bottom = seg.top + S(18);
+    
+    int cnt = 0; ULONGLONG selSize = 0; BOOL hasSelection = FALSE;
+    for (int i=0;i<g_itemCount;++i) { if (g_items[i].parent == c->rootId && g_items[i].type != IT_TRASH) { cnt++; if (g_items[i].selected) { hasSelection = TRUE; if (g_items[i].fromFS && g_items[i].path[0]) selSize += FS_GetFileSizeBytes(g_items[i].path); } } }
+    ULONGLONG freeSpaceK = 0;
+    
+    wchar_t currentPath[MAX_PATH] = L"";
+    if (c->rootId >= 0 && g_items[c->rootId].fromFS) lstrcpynW(currentPath, g_items[c->rootId].path, MAX_PATH);
+    else if (g_fsRootPath[0]) lstrcpynW(currentPath, g_fsRootPath, MAX_PATH);
+
+    if (currentPath[0]) { ULARGE_INTEGER freeBytes; if (GetDiskFreeSpaceExW(currentPath, &freeBytes, NULL, NULL)) freeSpaceK = freeBytes.QuadPart / 1024; }
+
+    RECT lR = seg; lR.left += S(6); lR.right = lR.left + S(300);
+    TextOutAlign(dc, lR.left, lR.top + S(2), currentPath[0]?currentPath:L"(Virtual)", TA_LEFT | TA_TOP);
+
+    wchar_t mid[64];
+    if (hasSelection) {
+        if (selSize < 1024) _snwprintf(mid, 63, L"Sel: %llu B", (unsigned long long)selSize);
+        else if (selSize < 1024*1024) _snwprintf(mid, 63, L"Sel: %.2f KB", selSize / 1024.0);
+        else if (selSize < 1024*1024*1024) _snwprintf(mid, 63, L"Sel: %.2f MB", selSize / 1048576.0);
+        else _snwprintf(mid, 63, L"Sel: %.2f GB", selSize / 1073741824.0);
+    } else { _snwprintf(mid, 63, L"%d items", cnt); }
+    TextOutAlign(dc, (seg.left+seg.right)/2, seg.top + S(2), mid, TA_TOP | TA_CENTER);
+    
+    wchar_t right[64];
+    if (freeSpaceK > 0) {
+        ULONGLONG freeSpaceB = freeSpaceK * 1024ULL;
+        if (freeSpaceB < 1024) _snwprintf(right, 63, L"%llu B free", (unsigned long long)freeSpaceB);
+        else if (freeSpaceB < 1024*1024) _snwprintf(right, 63, L"%.2f KB free", freeSpaceB / 1024.0);
+        else if (freeSpaceB < 1024*1024*1024) _snwprintf(right, 63, L"%.2f MB free", freeSpaceB / 1048576.0);
+        else _snwprintf(right, 63, L"%.2f GB free", freeSpaceB / 1073741824.0);
+    } else lstrcpyW(right, L"");
+    TextOutAlign(dc, seg.right - S(6), seg.top + S(2), right, TA_TOP | TA_RIGHT);
+    
+    SelectObject(dc, old); DeleteObject(font);
+}
+
+static void ItemPixelRect(const Layout* L, const WindowCtx* c, const Item* it, RECT* outIcon, RECT* outLabel) {
+    int originX = L->content.left + L->xStart; int originY = L->content.top  + L->yStart - (c ? c->scrollY : 0);
+    int x = originX + it->gridCol * L->colW; int y = originY + it->gridRow * L->rowH;
+    outIcon->left   = x; outIcon->top    = y; outIcon->right  = x + L->iconSize; outIcon->bottom = y + L->iconSize;
+    outLabel->left  = x; outLabel->top   = y + L->iconSize + S(8); outLabel->right = x + L->iconSize; outLabel->bottom= outLabel->top + L->labelH;
+}
+
+static void DrawCloseBox(HDC dc, const RECT* r) { HPEN pen = CreatePen(PS_SOLID, S(1), RGB(0,0,0)); HGDIOBJ oldP = SelectObject(dc, pen); HBRUSH br = (HBRUSH)GetStockObject(WHITE_BRUSH); HGDIOBJ oldB = SelectObject(dc, br); Rectangle(dc, r->left, r->top, r->right, r->bottom); MoveToEx(dc, r->left + S(3), r->top + S(3), NULL); LineTo(dc, r->right - S(3), r->bottom - S(3)); MoveToEx(dc, r->right - S(3), r->top + S(3), NULL); LineTo(dc, r->left + S(3), r->bottom - S(3)); SelectObject(dc, oldB); SelectObject(dc, oldP); DeleteObject(pen); }
+static void DrawGrowBox(HDC dc, const RECT* r) { HPEN pen = CreatePen(PS_SOLID, S(1), RGB(0,0,0)); HGDIOBJ old = SelectObject(dc, pen); Rectangle(dc, r->left, r->top, r->right, r->bottom); for (int i=0;i<S(12); i+=S(3)) { MoveToEx(dc, r->right - i, r->bottom, NULL); LineTo(dc, r->right, r->bottom - i); } SelectObject(dc, old); DeleteObject(pen); }
+
+static void DrawMacScrollbar(HDC dc, const Layout* L, WindowCtx* c) {
+    RECT r = L->scrollRect; HPEN border = CreatePen(PS_SOLID, 1, RGB(0,0,0)); HGDIOBJ op = SelectObject(dc, border); HBRUSH bg = CreateSolidBrush(RGB(230,230,230)); FillRect(dc, &r, bg); DeleteObject(bg);
+    RECT rTop = r; rTop.bottom = rTop.top + S(16); Rectangle(dc, rTop.left, rTop.top, rTop.right, rTop.bottom); int cx = (rTop.left + rTop.right)/2; int cy = (rTop.top + rTop.bottom)/2; MoveToEx(dc, cx, cy - S(3), NULL); LineTo(dc, cx - S(4), cy + S(3)); LineTo(dc, cx + S(4), cy + S(3)); LineTo(dc, cx, cy - S(3));
+    RECT rBot = r; rBot.top = rBot.bottom - S(16); Rectangle(dc, rBot.left, rBot.top, rBot.right, rBot.bottom); cx = (rBot.left + rBot.right)/2; cy = (rBot.top + rBot.bottom)/2; MoveToEx(dc, cx, cy + S(3), NULL); LineTo(dc, cx - S(4), cy - S(3)); LineTo(dc, cx + S(4), cy - S(3)); LineTo(dc, cx, cy + S(3));
+    MoveToEx(dc, r.left, rTop.bottom, NULL); LineTo(dc, r.left, rBot.top); MoveToEx(dc, r.right-1, rTop.bottom, NULL); LineTo(dc, r.right-1, rBot.top);
+    if (c->maxScroll > 0) {
+        int trackH = rBot.top - rTop.bottom; int viewH = L->content.bottom - L->content.top; int contentH = viewH + c->maxScroll; int thumbH = max(S(16), (int)((viewH / (float)contentH) * trackH)); int thumbY = rTop.bottom + (int)(((float)c->scrollY / c->maxScroll) * (trackH - thumbH));
+        RECT rThumb = { r.left, thumbY, r.right, thumbY + thumbH }; HBRUSH white = (HBRUSH)GetStockObject(WHITE_BRUSH); FillRect(dc, &rThumb, white); Rectangle(dc, rThumb.left, rThumb.top, rThumb.right, rThumb.bottom); int tcy = (rThumb.top + rThumb.bottom)/2; MoveToEx(dc, rThumb.left+S(2), tcy-S(2), NULL); LineTo(dc, rThumb.right-S(2), tcy-S(2)); MoveToEx(dc, rThumb.left+S(2), tcy, NULL); LineTo(dc, rThumb.right-S(2), tcy); MoveToEx(dc, rThumb.left+S(2), tcy+S(2), NULL); LineTo(dc, rThumb.right-S(2), tcy+S(2));
+    } SelectObject(dc, op); DeleteObject(border);
+}
+
+static void DrawOneItem(HDC dc, const Layout* L, const WindowCtx* c, const Item* it) {
+    RECT rI, rL; ItemPixelRect(L, c, it, &rI, &rL);
+    if (it->selected) { RECT hl = rI; InflateRect(&hl, S(6), S(6)); hl.bottom = rL.bottom + S(6); HBRUSH hbr = CreateSolidBrush(RGB(200, 220, 255)); HPEN hlPen = CreatePen(PS_SOLID, S(1), RGB(100, 150, 255)); HGDIOBJ oldP = SelectObject(dc, hlPen); HGDIOBJ oldB = SelectObject(dc, hbr); RoundRect(dc, hl.left, hl.top, hl.right, hl.bottom, S(8), S(8)); SelectObject(dc, oldB); SelectObject(dc, oldP); DeleteObject(hbr); DeleteObject(hlPen); }
+    if (it->type == IT_FOLDER) DrawFolderIcon(dc, rI.left, rI.top, L->iconSize); else if (it->type == IT_FILE) DrawFloppyIcon(dc, rI.left, rI.top, L->iconSize); else if (it->type == IT_TRASH) DrawTrashIcon(dc, rI.left, rI.top, L->iconSize, 0.0f); else if (it->type == IT_GROUP) DrawGroupIcon(dc, rI.left, rI.top, L->iconSize);
+    HFONT font = NULL; PickClassicFont(&font, 12, FALSE); HGDIOBJ old = SelectObject(dc, font); SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(0,0,0)); RECT txtR; txtR.top = rL.top; txtR.bottom = rL.top + L->labelH * 2; txtR.left = rI.left + L->iconSize/2 - L->colW/2 + S(4); txtR.right = rI.left + L->iconSize/2 + L->colW/2 - S(4); DrawTextW(dc, it->name, -1, &txtR, DT_CENTER | DT_TOP | DT_NOPREFIX | DT_END_ELLIPSIS | DT_SINGLELINE);
+    if (g_multiSelectMode) { int s = S(14); RECT chk = { rI.left - S(4), rI.top - S(4), rI.left - S(4) + s, rI.top - S(4) + s }; HBRUSH bg = CreateSolidBrush(RGB(255,255,255)); FillRect(dc, &chk, bg); DeleteObject(bg); HPEN pen = CreatePen(PS_SOLID, S(1), RGB(0,0,0)); HGDIOBJ oldP = SelectObject(dc, pen); Rectangle(dc, chk.left, chk.top, chk.right, chk.bottom); if (it->selected) { MoveToEx(dc, chk.left+S(2), chk.top+S(7), NULL); LineTo(dc, chk.left+S(6), chk.bottom-S(3)); LineTo(dc, chk.right-S(2), chk.top+S(2)); } SelectObject(dc, oldP); DeleteObject(pen); }
+    SelectObject(dc, old); DeleteObject(font);
+}
+
+static void DrawItemSprite(HDC dc, const Layout* L, const Item* it, int dx, int dy, int dw, int dh, BYTE alpha) {
+    int w = L->iconSize, h = L->iconSize; int labelH = L->labelH; int spriteW = w, spriteH = h + S(8) + labelH;
+    BITMAPINFO bi = {0}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); bi.bmiHeader.biWidth = spriteW; bi.bmiHeader.biHeight = -spriteH; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB; void* bits = NULL;
+    HDC memDC = CreateCompatibleDC(dc); HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0); HGDIOBJ oldBmp = SelectObject(memDC, bmp); HBRUSH wbr = (HBRUSH)GetStockObject(WHITE_BRUSH); RECT r = {0,0,spriteW,spriteH}; FillRect(memDC, &r, wbr);
+    if (it->type == IT_FOLDER) DrawFolderIcon(memDC, 0, 0, w); else if (it->type == IT_FILE) DrawFloppyIcon(memDC, 0, 0, w); else if (it->type == IT_TRASH) DrawTrashIcon(memDC, 0, 0, w, 0.0f); else DrawGroupIcon(memDC, 0, 0, w);
+    HFONT font = NULL; PickClassicFont(&font, 12, FALSE); HGDIOBJ oldF = SelectObject(memDC, font); SetBkMode(memDC, TRANSPARENT); SetTextColor(memDC, RGB(0,0,0)); RECT txtR = {0, h + S(8), spriteW, spriteH}; DrawTextW(memDC, it->name, -1, &txtR, DT_CENTER | DT_TOP | DT_NOPREFIX | DT_END_ELLIPSIS | DT_SINGLELINE); SelectObject(memDC, oldF); DeleteObject(font);
+    BLENDFUNCTION bf; bf.BlendOp = AC_SRC_OVER; bf.BlendFlags = 0; bf.SourceConstantAlpha = alpha; bf.AlphaFormat = 0; AlphaBlend(dc, dx, dy, dw, dh, memDC, 0, 0, spriteW, spriteH, bf);
+    SelectObject(memDC, oldBmp); DeleteObject(bmp); DeleteDC(memDC);
+}
+
+static int HitTestItem(const Layout* L, const WindowCtx* c, int x, int y) { for (int i=g_itemCount-1;i>=0;--i) { if (g_items[i].parent != c->rootId) continue; if (g_items[i].type == IT_TRASH) continue; RECT rI, rL; ItemPixelRect(L, c, &g_items[i], &rI, &rL); RECT hit = rI; InflateRect(&hit, S(6), S(6)); if (PtIn(&hit, x, y)) return i; RECT lab = rL; InflateRect(&lab, S(6), S(2)); if (PtIn(&lab, x, y)) return i; } return -1; }
+static BOOL IsOccupied(int rootId, int col, int row, int exceptIdx) { for (int i=0;i<g_itemCount;++i) { if (i==exceptIdx) continue; if (g_items[i].parent==rootId && g_items[i].type!=IT_TRASH && g_items[i].gridCol==col && g_items[i].gridRow==row) return TRUE; } return FALSE; }
+static void FindNextFree(const Layout* L, int rootId, int* ioCol, int* ioRow, int exceptIdx) { int originX = L->content.left + L->xStart; int originY = L->content.top  + L->yStart; int usableW = L->content.right - originX; int usableH = (L->content.bottom - S(24)) - originY; int cols = max(1, usableW / L->colW); int rows = max(1, usableH / L->rowH); int col=*ioCol, row=*ioRow; if (col<0) { col=0; } if (row<0) { row=0; } for (int r=row; r<rows+100; ++r) { for (int c=(r==row?col:0); c<cols; ++c) { if (!IsOccupied(rootId, c, r, exceptIdx)) { *ioCol=c; *ioRow=r; return; } } } *ioCol=0; *ioRow=row+1; }
+static void SnapToGrid(const Layout* L, const WindowCtx* c, int* ioCol, int* ioRow, int px, int py, int exceptIdx) { int originX = L->content.left + L->xStart; int originY = L->content.top  + L->yStart - (c ? c->scrollY : 0); int col = (int)floorf((px - originX + L->colW/2.0f) / (float)L->colW); int row = (int)floorf((py - originY + L->rowH/2.0f) / (float)L->rowH); if (col<0) { col=0; } if (row<0) { row=0; } FindNextFree(L, c->rootId, &col, &row, exceptIdx); *ioCol = col; *ioRow = row; }
+static void ClearSelection(int rootId) { for (int i=0;i<g_itemCount;++i) { if (g_items[i].parent==rootId && g_items[i].type!=IT_TRASH) g_items[i].selected = FALSE; } }
+static void DeleteItem(int idx) { if (idx < 0 || idx >= g_itemCount || idx == g_trashIndex) return; for (int i=g_itemCount-1; i>=0; --i) { if (g_items[i].parent==idx) DeleteItem(i); } for (int i=idx; i<g_itemCount-1; ++i) { g_items[i] = g_items[i+1]; } g_itemCount--; if (g_trashIndex > idx) g_trashIndex--; for (int i=0; i<g_itemCount; ++i) { if (g_items[i].parent>idx) g_items[i].parent--; } }
+static void NextAppendPosition(const Layout* L, int rootId, int* outCol, int* outRow) { int maxRow = 0, maxCol = -1; for (int i=0;i<g_itemCount;++i) { if (g_items[i].parent==rootId && g_items[i].type!=IT_TRASH) { if (g_items[i].gridRow > maxRow) { maxRow = g_items[i].gridRow; maxCol = g_items[i].gridCol; } else if (g_items[i].gridRow == maxRow && g_items[i].gridCol > maxCol) { maxCol = g_items[i].gridCol; } } } int col = (maxCol>=0)?(maxCol+1):0; int row = maxRow; int originX = L->content.left + L->xStart; int usableW = L->content.right - originX; int cols = max(1, usableW / L->colW); if (col>=cols) { col = 0; row++; } *outCol = col; *outRow = row; FindNextFree(L, rootId, outCol, outRow, -1); }
+static void AddItem(ItemType t, const wchar_t* name, const wchar_t* desc, int col, int row, int parent, const Layout* L) { if (g_itemCount >= MAX_ITEMS) return; if (col<0 || row<0) NextAppendPosition(L, parent, &col, &row); Item it = {0}; it.type = t; lstrcpynW(it.name, name, 63); lstrcpynW(it.desc, desc?desc:L"", 127); it.gridCol = col; it.gridRow = row; it.parent = parent; it.selected = FALSE; g_items[g_itemCount++] = it; }
+
+typedef struct { BOOL ok; wchar_t name[128]; wchar_t desc[256]; } DlgResult;
+static DlgResult g_lastDlg;
+
+static LRESULT CALLBACK MiniDlgProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+    switch (m) {
+        case WM_CREATE: { HFONT fL; PickClassicFont(&fL, 12, FALSE); SetWindowLongPtrW(w, GWLP_USERDATA, (LONG_PTR)fL); RECT rc; GetClientRect(w, &rc); int pad=S(12), lblW=S(80), edW=rc.right - pad*2 - lblW - S(10), rowH=S(22); CreateWindowExW(0, L"STATIC", L"Name:", WS_CHILD|WS_VISIBLE, pad, pad+rowH, lblW, rowH, w, NULL, g_hInst, NULL); CreateWindowExW(0, L"STATIC", L"Description:", WS_CHILD|WS_VISIBLE, pad, pad+rowH*2+S(8), lblW, rowH, w, NULL, g_hInst, NULL); HWND eName = CreateWindowExW(0, L"EDIT", L"", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, pad+lblW, pad+rowH, edW, rowH, w, (HMENU)100, g_hInst, NULL); HWND eDesc = CreateWindowExW(0, L"EDIT", L"", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, pad+lblW, pad+rowH*2+S(8), edW, rowH, w, (HMENU)101, g_hInst, NULL); HWND bOK   = CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD|WS_VISIBLE|BS_OWNERDRAW, rc.right - pad - S(120), rc.bottom - pad - rowH, S(50), rowH, w, (HMENU)1, g_hInst, NULL); HWND bCan  = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD|WS_VISIBLE|BS_OWNERDRAW, rc.right - pad - S(60), rc.bottom - pad - rowH, S(60), rowH, w, (HMENU)2, g_hInst, NULL); SendMessageW(eName, WM_SETFONT, (WPARAM)fL, TRUE); SendMessageW(eDesc, WM_SETFONT, (WPARAM)fL, TRUE); SendMessageW(bOK, WM_SETFONT, (WPARAM)fL, TRUE); SendMessageW(bCan, WM_SETFONT, (WPARAM)fL, TRUE); SetPropW(w, L"eName", eName); SetPropW(w, L"eDesc", eDesc); } return 0;
+        case WM_DRAWITEM: { LPDRAWITEMSTRUCT di = (LPDRAWITEMSTRUCT)lp; if (di->CtlID == 1 || di->CtlID == 2) { HDC dc = di->hDC; RECT r = di->rcItem; HBRUSH bg = CreateSolidBrush(RGB(255,255,255)); FillRect(dc, &r, bg); DeleteObject(bg); DrawClassicBezel(dc, r); if (di->itemState & ODS_SELECTED) InvertRect(dc, &r); wchar_t txt[64]; GetWindowTextW(di->hwndItem, txt, 63); HFONT f = (HFONT)GetWindowLongPtrW(w, GWLP_USERDATA); HGDIOBJ of = SelectObject(dc, f); SetBkMode(dc, TRANSPARENT); SetTextColor(dc, (di->itemState & ODS_SELECTED) ? RGB(255,255,255) : RGB(0,0,0)); DrawTextW(dc, txt, -1, &r, DT_CENTER|DT_VCENTER|DT_SINGLELINE); SelectObject(dc, of); return TRUE; } } return 0;
+        case WM_CTLCOLORSTATIC: { HDC dc = (HDC)wp; SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(0,0,0)); return (LRESULT)GetStockObject(WHITE_BRUSH); }
+        case WM_COMMAND: { if (LOWORD(wp)==1) { GetWindowTextW((HWND)GetPropW(w, L"eName"), g_lastDlg.name, 127); GetWindowTextW((HWND)GetPropW(w, L"eDesc"), g_lastDlg.desc, 255); g_lastDlg.ok = (g_lastDlg.name[0] != 0); DestroyWindow(w); return 0; } else if (LOWORD(wp)==2) { g_lastDlg.ok = FALSE; DestroyWindow(w); return 0; } } return 0;
+        case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(w, &ps); RECT r; GetClientRect(w, &r); HBRUSH white = (HBRUSH)GetStockObject(WHITE_BRUSH); FillRect(dc, &r, white); DrawClassicBezel(dc, r); RECT title = r; title.bottom = title.top + S(24); DrawPinstripe(dc, title); HFONT ft; PickClassicFont(&ft, 13, TRUE); HGDIOBJ of = SelectObject(dc, ft); SetBkMode(dc, TRANSPARENT); TextOutAlign(dc, (title.left+title.right)/2, title.top+S(4), L"Item", TA_TOP|TA_CENTER); SelectObject(dc, of); DeleteObject(ft); EndPaint(w, &ps); } return 0;
+        case WM_DESTROY: { HFONT f = (HFONT)GetWindowLongPtrW(w, GWLP_USERDATA); if (f) DeleteObject(f); RemovePropW(w, L"eName"); RemovePropW(w, L"eDesc"); } return 0;
+    } return DefWindowProcW(w, m, wp, lp);
+}
+
+static BOOL DoMiniDialog(HWND parent, const wchar_t* title, const wchar_t* initName, const wchar_t* initDesc, POINT at) {
+    g_lastDlg.ok = FALSE; wcscpy(g_lastDlg.name, initName?initName:L""); wcscpy(g_lastDlg.desc, initDesc?initDesc:L"");
+    HWND w = CreateWindowExW(WS_EX_TOOLWINDOW, kDlgClass, L"", WS_POPUP, at.x, at.y, S(420), S(180), parent, NULL, g_hInst, NULL);
+    if (!w) { return FALSE; } ShowWindow(w, SW_SHOW); HWND eName = (HWND)GetPropW(w, L"eName"), eDesc = (HWND)GetPropW(w, L"eDesc");
+    if (eName) { SetWindowTextW(eName, g_lastDlg.name); } if (eDesc) { SetWindowTextW(eDesc, g_lastDlg.desc); } UpdateWindow(w); MSG msg;
+    while (IsWindow(w) && GetMessageW(&msg, NULL, 0, 0)) { if (!IsDialogMessageW(w, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); } } return g_lastDlg.ok;
+}
+
+static void FS_ScanDirForRank(const wchar_t* dir, ULONGLONG targetSize, ULONGLONG* totalFiles, ULONGLONG* greaterCount) {
+    wchar_t mask[MAX_PATH]; _snwprintf(mask, MAX_PATH-1, L"%s\\*", dir); mask[MAX_PATH-1]=0;
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(mask, &fd); if (h==INVALID_HANDLE_VALUE) return;
+    do {
+        if (FS_IsDotDir(fd.cFileName)) continue;
+        wchar_t full[MAX_PATH]; _snwprintf(full, MAX_PATH-1, L"%s\\%s", dir, fd.cFileName); full[MAX_PATH-1]=0;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) FS_ScanDirForRank(full, targetSize, totalFiles, greaterCount);
+        else { ULARGE_INTEGER li; li.HighPart = fd.nFileSizeHigh; li.LowPart = fd.nFileSizeLow; ULONGLONG sz = li.QuadPart; (*totalFiles)++; if (sz > targetSize) (*greaterCount)++; }
+    } while (FindNextFileW(h, &fd)); FindClose(h);
+}
+
+static void FS_ComputeDiskRank(const wchar_t* filePath, ULONGLONG fileSize, ULONGLONG* outTotal, ULONGLONG* outRank) {
+    *outTotal = 0; *outRank = 0; if (!filePath || !filePath[0]) return;
+    wchar_t root[MAX_PATH]={0};
+    if (wcslen(filePath) >= 2 && filePath[1]==L':') {
+        _snwprintf(root, MAX_PATH-1, L"%c:", filePath[0]); root[2]=0; wchar_t pathRoot[MAX_PATH]; _snwprintf(pathRoot, MAX_PATH-1, L"%s\\", root);
+        ULONGLONG total=0, greater=0; FS_ScanDirForRank(pathRoot, fileSize, &total, &greater); *outTotal = total; *outRank  = greater + 1; 
+    }
+}
+
+typedef struct PropsData { HWND owner; wchar_t name[256]; wchar_t typeStr[64]; wchar_t path[MAX_PATH]; wchar_t desc[512]; wchar_t sizeStr[256]; double pctOfMax; wchar_t topLine[256]; wchar_t created[128]; wchar_t modified[128]; wchar_t attribs[128]; } PropsData;
+
+static void DrawBezelRect(HDC dc, RECT r) { HPEN light = CreatePen(PS_SOLID, 1, RGB(255,255,255)); HPEN dark  = CreatePen(PS_SOLID, 1, RGB(0,0,0)); HGDIOBJ old = SelectObject(dc, light); MoveToEx(dc, r.left, r.bottom-1, NULL); LineTo(dc, r.left, r.top); LineTo(dc, r.right-1, r.top); SelectObject(dc, dark); MoveToEx(dc, r.right-1, r.top, NULL); LineTo(dc, r.right-1, r.bottom-1); LineTo(dc, r.left, r.bottom-1); SelectObject(dc, old); DeleteObject(light); DeleteObject(dark); }
+static void DrawPinstripeHeader(HDC dc, RECT r) { HBRUSH bg = CreateSolidBrush(RGB(240,240,240)); FillRect(dc, &r, bg); DeleteObject(bg); HPEN pen = CreatePen(PS_SOLID, 1, RGB(200,200,200)); HGDIOBJ op = SelectObject(dc, pen); for (int y=r.top; y<r.bottom; y+=2) { MoveToEx(dc, r.left, y, NULL); LineTo(dc, r.right, y); } SelectObject(dc, op); DeleteObject(pen); pen = CreatePen(PS_SOLID, 1, RGB(0,0,0)); op = SelectObject(dc, pen); MoveToEx(dc, r.left, r.top, NULL); LineTo(dc, r.right, r.top); MoveToEx(dc, r.left, r.bottom-1, NULL); LineTo(dc, r.right, r.bottom-1); SelectObject(dc, op); DeleteObject(pen); }
+static void DrawSwirls(HDC dc, RECT r) { HPEN p = CreatePen(PS_SOLID, 1, RGB(0,0,0)); HGDIOBJ op = SelectObject(dc, p); POINT pts1[4] = { { r.left+12, r.top+10 }, { r.left+28, r.top+2 }, { r.left+44, r.top+20 }, { r.left+60, r.top+10 } }; PolyBezier(dc, pts1, 4); POINT pts2[4] = { { r.right-60, r.top+10 }, { r.right-44, r.top+2 }, { r.right-28, r.top+20 }, { r.right-12, r.top+10 } }; PolyBezier(dc, pts2, 4); SelectObject(dc, op); DeleteObject(p); }
+
+static LRESULT CALLBACK PropsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch(m) {
+    case WM_CREATE: {
+        CREATESTRUCTW* cs = (CREATESTRUCTW*)l; PropsData* pd = (PropsData*)cs->lpCreateParams; SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)pd);
+        CreateWindowExW(0, L"BUTTON", L"Copy Path", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 16, 430, 140, 26, h, (HMENU)101, GetModuleHandleW(NULL), NULL);
+        return 0;
+    }
+    case WM_COMMAND: {
+        if (LOWORD(w) == 101) {
+            PropsData* pd = (PropsData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+            SetClipboardText(h, pd->path[0] ? pd->path : pd->name);
+        }
+        return 0;
+    }
+    case WM_ERASEBKGND: return 1;
+    case WM_SIZE: InvalidateRect(h, NULL, TRUE); return 0;
+    case WM_NCHITTEST: { RECT cr; GetClientRect(h, &cr); RECT hdr = { cr.left, cr.top, cr.right, cr.top+42 }; RECT giz = { cr.right-16, cr.bottom-16, cr.right-4, cr.bottom-4 }; POINT cpt = { (short)LOWORD(l), (short)HIWORD(l) }; ScreenToClient(h, &cpt); RECT cbHT = { hdr.left+6, hdr.top+8, hdr.left+24, hdr.top+26 }; if (PtInRect(&cbHT, cpt)) { return HTCLIENT; } if (PtInRect(&hdr, cpt)) { return HTCAPTION; } if (PtInRect(&giz, cpt)) { return HTBOTTOMRIGHT; } return HTCLIENT; }
+    case WM_GETMINMAXINFO: { MINMAXINFO* mmi = (MINMAXINFO*)l; mmi->ptMinTrackSize.x = 480; mmi->ptMinTrackSize.y = 480; return 0; }
+    case WM_KEYDOWN: { if (w==VK_ESCAPE || w==VK_RETURN) { DestroyWindow(h); return 0; } break; }
+    case WM_LBUTTONUP: { RECT cr; GetClientRect(h, &cr); RECT hdr; hdr.left=cr.left; hdr.top=cr.top; hdr.right=cr.right; hdr.bottom=cr.top+36; RECT cb = { hdr.left+6, hdr.top+8, hdr.left+24, hdr.top+26 }; POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) }; if (PtInRect(&cb, pt)) { DestroyWindow(h); return 0; } RECT giz = { cr.right-16, cr.bottom-16, cr.right-4, cr.bottom-4 }; if (PtInRect(&giz, pt)) { DestroyWindow(h); return 0; } break; }
+    case WM_PAINT: {
+        PropsData* pd = (PropsData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); RECT cr; GetClientRect(h, &cr); HBRUSH wbg = CreateSolidBrush(RGB(255,255,255)); FillRect(dc, &cr, wbg); DeleteObject(wbg); SetBkMode(dc, TRANSPARENT);
+        RECT hdr = { cr.left, cr.top, cr.right, cr.top+42 }; DrawPinstripeHeader(dc, hdr); DrawSwirls(dc, hdr);
+        HFONT titleF = CreateFontW(24,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,0,0,L"Segoe UI"); HFONT bodyF  = CreateFontW(19,0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,0,0,L"Segoe UI");
+        HGDIOBJ oldF = SelectObject(dc, titleF); RECT t = hdr; t.top += 8; DrawTextW(dc, L"Свойства", -1, &t, DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+        RECT cb = { hdr.left+6, hdr.top+8, hdr.left+24, hdr.top+26 }; HPEN cbp = CreatePen(PS_SOLID, 1, RGB(0,0,0)); HGDIOBJ oldP_cb = SelectObject(dc, cbp); Rectangle(dc, cb.left, cb.top, cb.right, cb.bottom); MoveToEx(dc, cb.left+3, cb.top+3, NULL); LineTo(dc, cb.right-3, cb.bottom-3); MoveToEx(dc, cb.right-3, cb.top+3, NULL); LineTo(dc, cb.left+3, cb.bottom-3); SelectObject(dc, oldP_cb); DeleteObject(cbp); SelectObject(dc, bodyF);
+        RECT area = cr; area.top = hdr.bottom + 6; InflateRect(&area, -12, -12);
+        int labelW = 160, lineH = 32; const wchar_t* labels[10] = { L"Имя", L"Тип", L"Размер", L"Путь", L"Создан", L"Изменен", L"Атрибуты", L"Место на диске", L"Доля от макс.", L"Описание" };
+        wchar_t values[10][512]; lstrcpynW(values[0], pd->name[0]?pd->name:L"(без имени)", 511); lstrcpynW(values[1], pd->typeStr, 511); lstrcpynW(values[2], pd->sizeStr, 511); lstrcpynW(values[3], pd->path[0]?pd->path:L"(in-memory)", 511); lstrcpynW(values[4], pd->created, 511); lstrcpynW(values[5], pd->modified, 511); lstrcpynW(values[6], pd->attribs, 511); lstrcpynW(values[7], pd->topLine[0]?pd->topLine:L"(none)", 511); wchar_t pct[64]; _snwprintf(pct, 63, L"%.2f%%", (pd->pctOfMax>=0.0)?pd->pctOfMax:0.0); pct[63]=0; lstrcpynW(values[8], pct, 511); lstrcpynW(values[9], pd->desc[0]?pd->desc:L"(нет)", 511);
+        RECT lr, vr; int y = area.top; HPEN grid = CreatePen(PS_SOLID, 1, RGB(220,220,220)); HGDIOBJ oldP = SelectObject(dc, grid);
+        int sepX = area.left + labelW; MoveToEx(dc, sepX, area.top-4, NULL); LineTo(dc, sepX, area.bottom-60);
+        for (int i=0;i<10;i++) { int yy = y + lineH; MoveToEx(dc, area.left, yy, NULL); LineTo(dc, area.right, yy); lr.left = area.left; lr.right = sepX-8; lr.top = y; lr.bottom = y+lineH; vr.left = sepX+8; vr.right = area.right; vr.top = y; vr.bottom = y+lineH; DrawTextW(dc, labels[i], -1, &lr, DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX); DrawTextW(dc, values[i], -1, &vr, DT_LEFT|DT_SINGLELINE|DT_VCENTER|DT_PATH_ELLIPSIS|DT_NOPREFIX); y += lineH; }
+        SelectObject(dc, oldP); DeleteObject(grid); HPEN g = CreatePen(PS_SOLID, 1, RGB(0,0,0)); oldP = SelectObject(dc, g); MoveToEx(dc, cr.right-16, cr.bottom-4, NULL); LineTo(dc, cr.right-4, cr.bottom-16); Rectangle(dc, cr.right-16, cr.bottom-16, cr.right-4, cr.bottom-4); SelectObject(dc, oldP); DeleteObject(g); RECT bezel = cr; InflateRect(&bezel, -1, -1); DrawBezelRect(dc, bezel); SelectObject(dc, oldF); DeleteObject(titleF); DeleteObject(bodyF); EndPaint(h, &ps); return 0;
+    }
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_RBUTTONUP: {
+        PropsData* pd = (PropsData*)GetWindowLongPtrW(h, GWLP_USERDATA); int mx = GET_X_LPARAM(l), my = GET_Y_LPARAM(l); POINT pt = { mx, my }; ClientToScreen(h, &pt);
+        wchar_t dest[MAX_PATH]; dest[0]=0; BOOL canPaste = FALSE;
+        if (pd && pd->path[0]) { lstrcpynW(dest, pd->path, MAX_PATH); DWORD att = GetFileAttributesW(dest); if (att != INVALID_FILE_ATTRIBUTES) { if (att & FILE_ATTRIBUTE_DIRECTORY) canPaste = TRUE; else { wchar_t* slash = wcsrchr(dest, L'\\'); if (slash) { *slash = 0; DWORD att2 = GetFileAttributesW(dest); if (att2 != INVALID_FILE_ATTRIBUTES && (att2 & FILE_ATTRIBUTE_DIRECTORY)) canPaste = TRUE; } } } }
+        HMENU menu = CreatePopupMenu(); AppendMenuW(menu, MF_STRING, CMD_PROP_COPY, L"Copy"); AppendMenuW(menu, MF_STRING | (canPaste?0:MF_GRAYED), CMD_PROP_PASTE, L"Paste");
+        UINT sel = TrackPopupMenu(menu, TPM_RETURNCMD|TPM_LEFTALIGN|TPM_TOPALIGN, pt.x, pt.y, 0, h, NULL); DestroyMenu(menu);
+        if (sel == CMD_PROP_COPY) { SetClipboardText(h, (pd && pd->path[0]) ? pd->path : (pd && pd->name[0] ? pd->name : L"")); return 0; } else if (sel == CMD_PROP_PASTE && canPaste) { 
+            const wchar_t* p = (const wchar_t*)GlobalLock(GetClipboardData(CF_UNICODETEXT));
+            BOOL isMove = FALSE; const wchar_t* data = p;
+            if (p && wcsncmp(p, L"*MOVE*\n", 7) == 0) { isMove = TRUE; data += 7; }
+            else if (p && wcsncmp(p, L"*COPY*\n", 7) == 0) { data += 7; }
+            DoPasteIntoDirViaProgress(h, dest, data, isMove); 
+            return 0; 
+        }
+        return 0;
+    }
+    } return DefWindowProcW(h, m, w, l);
+}
+
+static void FormatFileTimeStr(FILETIME* ft, wchar_t* out, int outLen) {
+    SYSTEMTIME st, stLocal; FileTimeToSystemTime(ft, &st); SystemTimeToTzSpecificLocalTime(NULL, &st, &stLocal);
+    GetDateFormatW(LOCALE_USER_DEFAULT, DATE_SHORTDATE, &stLocal, NULL, out, outLen/2);
+    lstrcatW(out, L" "); int len = lstrlenW(out);
+    GetTimeFormatW(LOCALE_USER_DEFAULT, TIME_NOSECONDS, &stLocal, NULL, out+len, outLen/2 - len);
+}
+
+static HWND ShowPropertiesWindow(HWND owner, const PropsData* src) {
+    WNDCLASSW wc = {0}; wc.lpfnWndProc = PropsWndProc; wc.hInstance = GetModuleHandleW(NULL); wc.lpszClassName = L"Sys1PropsWnd"; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1); RegisterClassW(&wc);
+    PropsData* pd = (PropsData*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(PropsData)); if (!pd) return NULL; *pd = *src;
+    HWND w = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Properties", WS_POPUP|WS_SIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 520, 500, owner, NULL, wc.hInstance, pd);
+    if (w) { RECT r; SystemParametersInfoW(SPI_GETWORKAREA, 0, &r, 0); int x = r.left + (r.right-r.left-400)/2; int y = r.top + (r.bottom-r.top-400)/2; SetWindowPos(w, NULL, x, y, 0, 0, SWP_NOSIZE|SWP_NOZORDER); ShowWindow(w, SW_SHOWNORMAL); UpdateWindow(w); } else { HeapFree(GetProcessHeap(), 0, pd); } return w;
+}
+
+static void FS_FormatSizeDual(ULONGLONG bytes, wchar_t* out, int outc) {
+    if (bytes < 1024) _snwprintf(out, outc-1, L"%llu B", (unsigned long long)bytes); else if (bytes < 1024*1024) _snwprintf(out, outc-1, L"%.2f KB", bytes / 1024.0); else if (bytes < 1024*1024*1024) _snwprintf(out, outc-1, L"%.2f MB", bytes / 1048576.0); else _snwprintf(out, outc-1, L"%.2f GB", bytes / 1073741824.0);
+    out[outc-1] = 0;
+}
+
+typedef struct { const wchar_t* text; int id; BOOL enabled; } MenuItem;
+typedef struct { MenuItem* items; int count; int hot; int shown; int curH; } MenuState;
+
+static LRESULT CALLBACK MenuProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+    MenuState* st = (MenuState*)GetWindowLongPtrW(w, GWLP_USERDATA);
+    switch (m) {
+        case WM_CREATE: { CREATESTRUCTW* cs = (CREATESTRUCTW*)lp; st = (MenuState*)cs->lpCreateParams; SetWindowLongPtrW(w, GWLP_USERDATA, (LONG_PTR)st); st->hot = -1; st->shown = 0; st->curH = S(8); SetCapture(w); SetTimer(w, 1, 70, NULL); } return 0;
+        case WM_TIMER: { if (wp==1) { if (st->shown < st->count) { st->shown++; int targetH = S(20)*st->shown + S(10); RECT wr; GetWindowRect(w, &wr); SetWindowPos(w, NULL, wr.left, wr.top, wr.right-wr.left, targetH, SWP_NOZORDER|SWP_NOMOVE); InvalidateRect(w, NULL, FALSE); } else KillTimer(w,1); } } return 0;
+        case WM_MOUSEMOVE: { int y = GET_Y_LPARAM(lp); int h = S(20); int idx = y / h; if (idx >=0 && idx < st->shown && st->items[idx].enabled) st->hot = idx; else st->hot = -1; InvalidateRect(w, NULL, FALSE); } return 0;
+        case WM_LBUTTONUP: { 
+            ReleaseCapture(); 
+            int y = GET_Y_LPARAM(lp); int h = S(20); int idx = y / h; 
+            int cmd = (idx>=0 && idx<st->shown && st->items[idx].enabled) ? st->items[idx].id : 0; 
+            if (cmd) PostMessageW(w, WM_COMMAND, MAKEWPARAM(cmd, 0), 0); 
+            else DestroyWindow(w); 
+        } return 0;
+        case WM_COMMAND: { DestroyWindow(w); } return 0;
+        case WM_KEYDOWN: if (wp==VK_ESCAPE) { ReleaseCapture(); DestroyWindow(w); } return 0;
+        case WM_KILLFOCUS: ReleaseCapture(); DestroyWindow(w); return 0;
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(w, &ps); RECT r; GetClientRect(w, &r); HBRUSH wbr = (HBRUSH)GetStockObject(WHITE_BRUSH); FillRect(dc, &r, wbr); DrawClassicBezel(dc, r); HFONT f; PickClassicFont(&f, 12, FALSE); HGDIOBJ of = SelectObject(dc, f); SetBkMode(dc, TRANSPARENT); int h = S(20); for (int i=0;i<st->shown && i<st->count;++i) { RECT ri = { r.left+S(6), r.top + i*h, r.right-S(6), r.top + (i+1)*h }; if (st->hot==i) { HBRUSH g = CreateSolidBrush(RGB(220,220,220)); FillRect(dc, &ri, g); DeleteObject(g); } TextOutW(dc, ri.left, ri.top+S(3), st->items[i].text, lstrlenW(st->items[i].text)); } SelectObject(dc, of); DeleteObject(f); EndPaint(w, &ps); } return 0;
+        case WM_DESTROY: { if (st) HeapFree(GetProcessHeap(), 0, st); } return 0;
+    } return DefWindowProcW(w, m, wp, lp);
+}
+
+static UINT ShowMacMenu(HWND owner, POINT pt, MenuItem* items, int count) {
+    int w = S(200), h = S(10); 
+    MenuState* st = (MenuState*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(MenuState)); 
+    st->items = items; st->count = count; st->hot = -1; st->shown=0; st->curH=h;
+    HWND wMenu = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kMenuClass, L"", WS_POPUP, pt.x, pt.y, w, h, owner, NULL, g_hInst, st); 
+    ShowWindow(wMenu, SW_SHOWNOACTIVATE); UpdateWindow(wMenu); 
+    MSG msg; UINT cmd = 0; 
+    while (GetMessageW(&msg, NULL, 0, 0)) { 
+        TranslateMessage(&msg); 
+        DispatchMessageW(&msg); 
+        if (msg.message == WM_COMMAND && msg.hwnd == wMenu) { 
+            cmd = LOWORD(msg.wParam); 
+        } 
+        if (!IsWindow(wMenu)) { break; } 
+    } 
+    return cmd;
+}
+
+static void ShowFavoritesMenu(HWND h) {
+    EnsureFavFile();
+    FILE* f = _wfopen(g_favFile, L"rt,ccs=UTF-8");
+    MenuItem items[35]; int n = 0;
+    items[n++] = (MenuItem){L"[+] Add to Favorites", 3000, TRUE};
+    items[n++] = (MenuItem){L"----------------", 0, FALSE};
+
+    wchar_t paths[30][MAX_PATH] = {0};
+    int pathCount = 0;
+
+    if (f) {
+        wchar_t line[1024];
+        while (fgetws(line, 1024, f) && n < 32) {
+            wchar_t* p1 = wcsstr(line, L"--");
+            if (!p1) continue;
+            *p1 = 0;
+            wchar_t* pPath = p1 + 2;
+            wchar_t* p2 = wcsstr(pPath, L"--");
+            if (p2) *p2 = 0;
+
+            wchar_t* name = line;
+            TrimInPlaceW(name); TrimInPlaceW(pPath);
+
+            if (name[0] && pPath[0]) {
+                wchar_t* label = (wchar_t*)LocalAlloc(LMEM_FIXED, 256*sizeof(wchar_t));
+                lstrcpynW(label, name, 63);
+                items[n++] = (MenuItem){label, 3001 + pathCount, TRUE};
+                lstrcpynW(paths[pathCount], pPath, MAX_PATH-1);
+                pathCount++;
+            }
+        }
+        fclose(f);
+    }
+
+    POINT pt; GetCursorPos(&pt);
+    UINT sel = ShowMacMenu(h, pt, items, n);
+
+    for (int i=2; i<n; i++) LocalFree((void*)items[i].text);
+
+    if (sel == 3000) {
+        HWND fw = GetForegroundWindow();
+        wchar_t cls[64]; GetClassNameW(fw, cls, 63);
+        if (lstrcmpW(cls, kWndClass) != 0) fw = NULL;
+
+        if (fw) {
+            WindowCtx* c = Ctx(fw);
+            wchar_t curPath[MAX_PATH] = L"";
+            wchar_t curName[64] = L"";
+            if (c && c->rootId >= 0 && g_items[c->rootId].fromFS) {
+                lstrcpynW(curPath, g_items[c->rootId].path, MAX_PATH);
+                lstrcpynW(curName, g_items[c->rootId].name, 63);
+            } else if (g_fsRootPath[0] && lstrcmpW(g_fsRootPath, L":Computer:")!=0 && lstrcmpW(g_fsRootPath, L":Search:")!=0) {
+                lstrcpynW(curPath, g_fsRootPath, MAX_PATH);
+                const wchar_t* sl = wcsrchr(curPath, L'\\');
+                if (sl && *(sl+1)) lstrcpynW(curName, sl+1, 63);
+                else lstrcpynW(curName, curPath, 63);
+            }
+
+            if (curPath[0]) {
+                FILE* fa = _wfopen(g_favFile, L"at,ccs=UTF-8");
+                if (fa) {
+                    fwprintf(fa, L"%s --%s--\n", curName, curPath);
+                    fclose(fa);
+                }
+            }
+        }
+    } else if (sel > 3000) {
+        int idx = sel - 3001;
+        wchar_t* p = paths[idx];
+        DWORD attr = GetFileAttributesW(p);
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            int W = S(760), H = S(500);
+            int sx = GetSystemMetrics(SM_CXSCREEN);
+            int sy = GetSystemMetrics(SM_CYSCREEN);
+            int wx = (sx - W) / 2 + (g_windowCount * 20);
+            int wy = (sy - H) / 2 + (g_windowCount * 20);
+            HWND win = CreateWindowW(kWndClass, L"", WS_POPUP, wx, wy, W, H, NULL, NULL, g_hInst, p);
+            if (win) {
+                ShowWindow(win, SW_SHOWDEFAULT);
+                UpdateWindow(win);
+            }
+        }
+    }
+}
+
+static const wchar_t* wcsistr(const wchar_t* hay, const wchar_t* needle) {
+    if (!hay || !needle || !*needle) return hay; 
+    size_t nlen = lstrlenW(needle);
+    for (const wchar_t* p=hay; *p; ++p) { if (towlower(*p) == towlower(*needle)) { size_t i=1; for (; i<nlen && p[i]; ++i) if (towlower(p[i]) != towlower(needle[i])) break; if (i==nlen) return p; } } return NULL;
+}
+
+static void DrawElevatorNav(HDC dc, const Layout* L, WindowCtx* c) {
+    int elX = L->annex.left + S(24); int elY_start = L->annex.top + S(20); int elSpacing = S(30); HPEN linePen = CreatePen(PS_SOLID, S(2), RGB(0,0,0)); HGDIOBJ oldPen = SelectObject(dc, linePen); MoveToEx(dc, elX, elY_start, NULL); LineTo(dc, elX, elY_start + 9 * elSpacing); SelectObject(dc, oldPen); DeleteObject(linePen);
+    for(int i=0; i<10; i++) { int cy = elY_start + i * elSpacing; int rad = S(6); RECT cr = { elX - rad, cy - rad, elX + rad, cy + rad }; if (i <= g_navDepth) { HBRUSH br = CreateSolidBrush((i == g_navDepth && !c->elevAnimActive) ? RGB(160,160,160) : RGB(0,0,0)); HGDIOBJ ob = SelectObject(dc, br); Ellipse(dc, cr.left, cr.top, cr.right, cr.bottom); SelectObject(dc, ob); DeleteObject(br); } else { HBRUSH br = CreateSolidBrush(RGB(255,255,255)); HPEN outPen = CreatePen(PS_SOLID, S(2), RGB(0,0,0)); HGDIOBJ ob = SelectObject(dc, br); HGDIOBJ op = SelectObject(dc, outPen); Ellipse(dc, cr.left, cr.top, cr.right, cr.bottom); SelectObject(dc, op); SelectObject(dc, ob); DeleteObject(outPen); DeleteObject(br); } }
+    if (c->elevAnimActive) { int rad = S(6); RECT cr = { elX - rad, (int)c->elevCurY - rad, elX + rad, (int)c->elevCurY + rad }; HBRUSH br = CreateSolidBrush(RGB(160,160,160)); HGDIOBJ ob = SelectObject(dc, br); Ellipse(dc, cr.left, cr.top, cr.right, cr.bottom); SelectObject(dc, ob); DeleteObject(br); }
+}
+
+static void PaintAll(HWND h, HDC dc, const Layout* L) {
+    WindowCtx* c = Ctx(h); HBRUSH bg = (HBRUSH)GetStockObject(WHITE_BRUSH); FillRect(dc, &L->client, bg); DrawClassicBezel(dc, L->outer); DrawPinstripe(dc, L->titleBar);
+    HPEN annexPen = CreatePen(PS_SOLID, S(2), RGB(0,0,0)); HGDIOBJ oldA = SelectObject(dc, annexPen); MoveToEx(dc, L->annex.right, L->annex.top, NULL); LineTo(dc, L->annex.right, L->annex.bottom); SelectObject(dc, oldA); DeleteObject(annexPen);
+    HFONT fontTitle = NULL; PickClassicFont(&fontTitle, 14, TRUE); HGDIOBJ oldFont = SelectObject(dc, fontTitle); SetTextColor(dc, RGB(0,0,0)); SetBkMode(dc, TRANSPARENT); const wchar_t* title = (c->rootId==-2) ? L"Search Results" : ((c->rootId<0) ? (lstrcmpW(g_fsRootPath, L":Computer:") == 0 ? L"Computer" : L"KI") : g_items[c->rootId].name); TextOutAlign(dc, (L->titleBar.left+L->titleBar.right)/2, L->titleBar.top + S(6), title, TA_TOP | TA_CENTER); SelectObject(dc, oldFont); DeleteObject(fontTitle);
+    DrawCloseBox(dc, &L->closeBox); DrawStatusLine(dc, L, c); DrawGrowBox(dc, &L->growBox); DrawMacScrollbar(dc, L, c); DrawElevatorNav(dc, L, c);
+
+    HRGN hRgn = CreateRectRgn(L->content.left, L->content.top, L->content.right, L->content.bottom);
+    SelectClipRgn(dc, hRgn);
+
+    int originY = L->content.top + L->yStart - c->scrollY;
+    for (int i=0;i<g_itemCount;++i) { 
+        if (g_items[i].parent != c->rootId || g_items[i].type == IT_TRASH) continue; 
+        if (c->dragging && c->dragIdx==i) continue; 
+        if (c->moveAnimActive && g_items[i].selected) continue; 
+        if (c->delActive && g_items[i].selected) continue; 
+        int itemTop = originY + g_items[i].gridRow * L->rowH;
+        if (itemTop + L->rowH + S(30) < L->content.top || itemTop > L->content.bottom) continue;
+        DrawOneItem(dc, L, c, &g_items[i]); 
+    }
+    
+    if (c->dragging && c->dragIdx>=0 && c->dragIdx<g_itemCount && g_items[c->dragIdx].parent==c->rootId) { 
+        int dw = L->iconSize, dh = L->iconSize + S(8) + L->labelH; 
+        DrawItemSprite(dc, L, &g_items[c->dragIdx], c->dragAt.x, c->dragAt.y, dw, dh, 200); 
+        
+        int selCount = 0;
+        for (int i=0; i<g_itemCount; ++i) if (g_items[i].parent == c->rootId && g_items[i].selected && g_items[i].type != IT_TRASH) selCount++;
+        if (selCount > 1) {
+            wchar_t badge[16]; _snwprintf(badge, 15, L"%d", selCount);
+            RECT br = { c->dragAt.x + dw - S(20), c->dragAt.y - S(10), c->dragAt.x + dw + S(4), c->dragAt.y + S(14) };
+            HBRUSH bgR = CreateSolidBrush(RGB(220, 60, 60)); HGDIOBJ ob = SelectObject(dc, bgR);
+            HPEN pR = CreatePen(PS_SOLID, S(1), RGB(255,255,255)); HGDIOBJ op = SelectObject(dc, pR);
+            RoundRect(dc, br.left, br.top, br.right, br.bottom, S(12), S(12));
+            HFONT fBadge = NULL; PickClassicFont(&fBadge, 14, TRUE); HGDIOBJ of = SelectObject(dc, fBadge);
+            SetTextColor(dc, RGB(255,255,255)); SetBkMode(dc, TRANSPARENT);
+            DrawTextW(dc, badge, -1, &br, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            SelectObject(dc, of); DeleteObject(fBadge);
+            SelectObject(dc, op); DeleteObject(pR);
+            SelectObject(dc, ob); DeleteObject(bgR);
+        }
+    }
+    if (c->moveAnimActive && c->moveDstIdx>=0) {
+        RECT rDstI, rDstL; ItemPixelRect(L, c, &g_items[c->moveDstIdx], &rDstI, &rDstL); float scale = 1.0f - 0.6f * c->moveStep; BYTE alpha = (BYTE)(255 * (1.0f - c->moveStep));
+        for (int i=0; i<g_itemCount; ++i) { if (g_items[i].parent == c->rootId && g_items[i].selected && g_items[i].type != IT_TRASH && i != c->moveDstIdx) { RECT rSrcI, rSrcL; ItemPixelRect(L, c, &g_items[i], &rSrcI, &rSrcL); int curX = rSrcI.left + (int)((rDstI.left - rSrcI.left) * c->moveStep); int curY = rSrcI.top + (int)((rDstI.top - rSrcI.top) * c->moveStep); int dw = (int)(L->iconSize * scale); int dh = (int)((L->iconSize + S(8) + L->labelH) * scale); DrawItemSprite(dc, L, &g_items[i], curX, curY, dw, dh, alpha); } }
+    }
+    if (c->delActive) {
+        float t = c->delStep / 20.0f; 
+        float scale = 1.0f - 0.9f*t; 
+        BYTE alpha = (BYTE)(255 * (1.0f - t));
+        
+        POINT ptTrash = {0};
+        if (g_topBar) {
+            RECT tbRect; GetWindowRect(g_topBar, &tbRect);
+            ptTrash.x = tbRect.left + (g_topBarTrash.left + g_topBarTrash.right)/2;
+            ptTrash.y = tbRect.top + (g_topBarTrash.top + g_topBarTrash.bottom)/2;
+            ScreenToClient(h, &ptTrash);
+        }
+
+        for (int i=0; i<g_itemCount; ++i) { 
+            if (g_items[i].parent == c->rootId && g_items[i].selected && g_items[i].type != IT_TRASH) { 
+                RECT rI,rL; ItemPixelRect(L, c, &g_items[i], &rI, &rL); 
+                int startCx = (rI.left + rI.right)/2; 
+                int startCy = (rI.top + rI.bottom)/2; 
+                
+                int cx = startCx;
+                int cy = startCy;
+                if (g_topBar) {
+                    cx += (int)((ptTrash.x - startCx) * t);
+                    cy += (int)((ptTrash.y - startCy) * t);
+                }
+
+                int dw = (int)((L->iconSize + S(8) + L->labelH) * scale); 
+                int dh = (int)((L->iconSize + S(8) + L->labelH) * scale); 
+                DrawItemSprite(dc, L, &g_items[i], cx - dw/2, cy - dh/2, dw, dh, alpha); 
+            } 
+        }
+    }
+    if (c->copyActive) {
+        float t = c->copyStep / 10.0f; int expand = (int)(t * S(15)); HPEN p = CreatePen(PS_SOLID, S(2), RGB(0,0,0)); HGDIOBJ op = SelectObject(dc, p); HBRUSH ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        for (int i=0; i<g_itemCount; ++i) { if (g_items[i].parent == c->rootId && g_items[i].selected && g_items[i].type != IT_TRASH) { RECT rI,rL; ItemPixelRect(L, c, &g_items[i], &rI, &rL); RECT hl = rI; InflateRect(&hl, expand, expand); Rectangle(dc, hl.left, hl.top, hl.right, hl.bottom); } } SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(p);
+    }
+    if (c->lasso) { HPEN pen = CreatePen(PS_DOT, 1, RGB(0,0,0)); HGDIOBJ op = SelectObject(dc, pen); Rectangle(dc, c->lassoRect.left, c->lassoRect.top, c->lassoRect.right, c->lassoRect.bottom); SelectObject(dc, op); DeleteObject(pen); }
+    if (c->openActive) { RECT r = c->openRect; HPEN pen = CreatePen(PS_SOLID, S(2), RGB(0,0,0)); HGDIOBJ op = SelectObject(dc, pen); Rectangle(dc, r.left, r.top, r.right, r.bottom); SelectObject(dc, op); DeleteObject(pen); }
+    
+    SelectClipRgn(dc, NULL); DeleteObject(hRgn);
+
+    if (g_ttVisible && g_ttItem >= 0 && g_ttItem < g_itemCount) {
+        const Item* it = &g_items[g_ttItem]; RECT cr = L->client; int W = S(280), H = S(80); RECT tip = { g_ttPos.x + S(12), g_ttPos.y + S(12), g_ttPos.x + S(12) + W, g_ttPos.y + S(12) + H };
+        if (tip.right > cr.right - S(6)) { int dx = tip.right - (cr.right - S(6)); OffsetRect(&tip, -dx, 0); } if (tip.bottom > cr.bottom - S(6)) { int dy = tip.bottom - (cr.bottom - S(6)); OffsetRect(&tip, 0, -dy); }
+        wchar_t title[256], body[256]; lstrcpynW(title, it->name[0] ? it->name : L"(без имени)", 255); if (it->desc[0]) lstrcpynW(body, it->desc, 255); else lstrcpynW(body, it->path[0]?it->path:L"(нет пути)", 255); DrawTooltipSmall(dc, tip, title, body);
+    }
+}
+
+enum { CMD_RENAME=1, CMD_DELETE, CMD_NEW_FOLDER, CMD_NEW_FILE, CMD_NEW_GROUP, CMD_REMOVE_FROM_GROUP, CMD_PROPERTIES, CMD_COPY, CMD_CUT, CMD_PASTE, CMD_COMPUTER, CMD_REFRESH, CMD_SORT_NAME, CMD_SORT_DATE, CMD_SORT_SIZE };
+
+static void EndInlineRename(HWND h, BOOL save) { WindowCtx* c = Ctx(h); if (!c->renActive) return; if (save && c->renIndex>=0 && c->renIndex<g_itemCount) { wchar_t buf[128]; GetWindowTextW(c->renEdit, buf, 127); if (buf[0]) lstrcpynW(g_items[c->renIndex].name, buf, 63); } DestroyWindow(c->renEdit); c->renEdit=NULL; if (c->renFont){ DeleteObject(c->renFont); c->renFont=NULL; } c->renActive=FALSE; c->renIndex=-1; InvalidateRect(h, NULL, FALSE); }
+static void BeginInlineRename(HWND h, const Layout* L, WindowCtx* c, int idx) { EndInlineRename(h, FALSE); RECT rI, rL; ItemPixelRect(L, c, &g_items[idx], &rI, &rL); RECT editR = rL; InflateRect(&editR, S(8), S(2)); HWND e = CreateWindowExW(0, L"EDIT", g_items[idx].name, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, editR.left, editR.top, editR.right-editR.left, editR.bottom-editR.top, h, (HMENU)500, g_hInst, NULL); HFONT f; PickClassicFont(&f, 12, FALSE); SendMessageW(e, WM_SETFONT, (WPARAM)f, TRUE); c->renFont=f; SendMessageW(e, EM_SETSEL, 0, -1); SetFocus(e); c->renActive=TRUE; c->renIndex=idx; c->renEdit=e; }
+
+static BOOL FS_IsDotOrDotDot(const WIN32_FIND_DATAW* fd) { return (lstrcmpW(fd->cFileName, L".") == 0 || lstrcmpW(fd->cFileName, L"..") == 0); }
+static void ItemSetPath(Item* it, const wchar_t* fullPath) { if (!fullPath) { it->path[0] = 0; return; } lstrcpynW(it->path, fullPath, MAX_PATH-1); it->fromFS = TRUE; }
+static void FS_ClearChildren(int parentId) { for (int i=g_itemCount-1; i>=0; --i) if (g_items[i].parent == parentId && g_items[i].type != IT_TRASH) DeleteItem(i); }
+
+static void AddItemFS(ItemType t, const wchar_t* name, const wchar_t* fullPath, int col, int row, int parent, const Layout* L, BOOL scannedFolder) { if (g_itemCount >= MAX_ITEMS) return; if (col<0 || row<0) NextAppendPosition(L, parent, &col, &row); Item it = {0}; it.type = t; lstrcpynW(it.name, name ? name : L"", 63); it.gridCol = col; it.gridRow = row; it.parent  = parent; it.selected = FALSE; it.fromFS = TRUE; it.scanned = scannedFolder; ItemSetPath(&it, fullPath); g_items[g_itemCount++] = it; }
+static void FS_PopulateOneLevel(const wchar_t* dir, int parentId, const Layout* L) {
+    wchar_t mask[MAX_PATH]; lstrcpynW(mask, dir, MAX_PATH-1); size_t n = wcslen(mask); if (n && (mask[n-1] != L'\\' && mask[n-1] != L'/')) { lstrcatW(mask, L"\\"); } lstrcatW(mask, L"*");
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(mask, &fd); if (h == INVALID_HANDLE_VALUE) return;
+    
+    int originX = L->content.left + L->xStart;
+    int usableW = L->content.right - originX;
+    int cols = max(1, usableW / L->colW);
+    int curIdx = 0;
+    
+    do {
+        if (FS_IsDotOrDotDot(&fd)) continue; 
+        if (g_itemCount >= MAX_ITEMS - 1) break;
+        
+        wchar_t full[MAX_PATH]; lstrcpynW(full, dir, MAX_PATH-1); if (full[0] && full[wcslen(full)-1] != L'\\') lstrcatW(full, L"\\"); lstrcatW(full, fd.cFileName);
+        BOOL isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        
+        Item it = {0};
+        it.type = isDir ? IT_FOLDER : IT_FILE;
+        lstrcpynW(it.name, fd.cFileName, 63);
+        it.gridCol = curIdx % cols;
+        it.gridRow = curIdx / cols;
+        it.parent = parentId;
+        it.fromFS = TRUE;
+        it.scanned = !isDir;
+        it.lastWriteTime = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        it.sizeCache = isDir ? 0 : (((ULARGE_INTEGER*)&fd.nFileSizeLow)->QuadPart);
+        ItemSetPath(&it, full);
+        g_items[g_itemCount++] = it;
+        
+        curIdx++;
+    } while (FindNextFileW(h, &fd)); FindClose(h);
+}
+
+static void FS_PopulateRootFromPath(const wchar_t* dir, const Layout* L) {
+    if (lstrcmpW(dir, L":Search:") == 0) return;
+    if (lstrcmpW(dir, L":Computer:") == 0) { lstrcpynW(g_fsRootPath, L":Computer:", MAX_PATH-1); FS_ClearChildren(-1); wchar_t drives[256]; DWORD r = GetLogicalDriveStringsW(255, drives); if (r > 0) { wchar_t* p = drives; while (*p) { wchar_t name[16]; lstrcpynW(name, p, 15); AddItemFS(IT_FOLDER, name, p, -1, -1, -1, L, TRUE); p += lstrlenW(p) + 1; } } return; }
+    lstrcpynW(g_fsRootPath, dir, MAX_PATH-1); FS_ClearChildren(-1); FS_PopulateOneLevel(dir, -1, L);
+}
+
+static void SetupDirectoryMonitor(HWND h, WindowCtx* c, const wchar_t* path) { if (c->hDirMonitor) { FindCloseChangeNotification(c->hDirMonitor); c->hDirMonitor = NULL; } if (path && path[0] && lstrcmpW(path, L":Computer:") != 0 && lstrcmpW(path, L":Search:") != 0) { c->hDirMonitor = FindFirstChangeNotificationW(path, FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE); } }
+
+static int CmpItemName(const void* a, const void* b) {
+    Item* ia = (Item*)a; Item* ib = (Item*)b;
+    if (ia->type == IT_FOLDER && ib->type != IT_FOLDER) return -1;
+    if (ia->type != IT_FOLDER && ib->type == IT_FOLDER) return 1;
+    return lstrcmpiW(ia->name, ib->name);
+}
+
+static int CmpItemDate(const void* a, const void* b) {
+    Item* ia = (Item*)a; Item* ib = (Item*)b;
+    if (ia->type == IT_FOLDER && ib->type != IT_FOLDER) return -1;
+    if (ia->type != IT_FOLDER && ib->type == IT_FOLDER) return 1;
+    if (ia->lastWriteTime > ib->lastWriteTime) return -1;
+    if (ia->lastWriteTime < ib->lastWriteTime) return 1;
+    return 0;
+}
+
+static int CmpItemSize(const void* a, const void* b) {
+    Item* ia = (Item*)a; Item* ib = (Item*)b;
+    if (ia->type == IT_FOLDER && ib->type != IT_FOLDER) return -1;
+    if (ia->type != IT_FOLDER && ib->type == IT_FOLDER) return 1;
+    if (ia->sizeCache > ib->sizeCache) return -1;
+    if (ia->sizeCache < ib->sizeCache) return 1;
+    return 0;
+}
+
+static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    WindowCtx* c = Ctx(h); static BOOL resizing = FALSE; static POINT resizeStartMouse; static RECT resizeStartWnd;
+    switch (m) {
+        case WM_CREATE: {
+            CREATESTRUCTW* cs = (CREATESTRUCTW*)l;
+            g_windowCount++; SetDpiAware();
+            WindowCtx* nc = (WindowCtx*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(WindowCtx)); nc->rootId = -1; SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)nc);
+            RegisterHotKey(h, 99, MOD_WIN, VK_RETURN);
+            wchar_t startDir[MAX_PATH];
+            BOOL okDir = FALSE;
+            if (cs->lpCreateParams) {
+                lstrcpynW(startDir, (wchar_t*)cs->lpCreateParams, MAX_PATH);
+                okDir = TRUE;
+            } else {
+                okDir = GetDesktopPath(startDir);
+            }
+            if (okDir) { g_navDepth = 0; lstrcpynW(g_navHistory[0], startDir, MAX_PATH); SetupDirectoryMonitor(h, nc, startDir); Layout L; ComputeLayout(h, &L); FS_PopulateRootFromPath(startDir, &L); }
+            SetTimer(h, 100, 500, NULL); DragAcceptFiles(h, TRUE); EnsureAssocFile();
+            
+            WNDCLASSW wc = {0}; wc.lpfnWndProc = MiniDlgProc; wc.hInstance = g_hInst; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName = kDlgClass; RegisterClassW(&wc);
+            wc = (WNDCLASSW){0}; wc.lpfnWndProc = MenuProc; wc.hInstance=g_hInst; wc.hCursor=LoadCursor(NULL, IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName = kMenuClass; RegisterClassW(&wc);
+            wc = (WNDCLASSW){0}; wc.lpfnWndProc = AppleProc; wc.hInstance=g_hInst; wc.hCursor=LoadCursor(NULL, IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName = kAppleClass; RegisterClassW(&wc);
+            wc = (WNDCLASSW){0}; wc.lpfnWndProc = ApplePopupProc; wc.hInstance=g_hInst; wc.hCursor=LoadCursor(NULL, IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName = kApplePopupClass; RegisterClassW(&wc);
+            wc = (WNDCLASSW){0}; wc.lpfnWndProc = ProgressProc; wc.hInstance=g_hInst; wc.hCursor=LoadCursor(NULL, IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName = kProgClass; RegisterClassW(&wc);
+            if (!g_appleWnd) { g_appleWnd = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW, kAppleClass, L"", WS_POPUP, S(10), S(10), S(56), S(56), NULL, NULL, g_hInst, NULL); ShowWindow(g_appleWnd, SW_SHOWNOACTIVATE); UpdateWindow(g_appleWnd); }
+        } return 0;
+        case WM_DROPFILES: {
+            HDROP hDrop = (HDROP)w; int count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
+            if (count > 0) {
+                POINT pt; DragQueryPoint(hDrop, &pt); Layout L; ComputeLayout(h, &L); int hit = HitTestItem(&L, c, pt.x, pt.y); wchar_t destDir[MAX_PATH] = {0};
+                if (hit >= 0 && g_items[hit].type == IT_FOLDER && g_items[hit].fromFS) { lstrcpynW(destDir, g_items[hit].path, MAX_PATH); } else { if (c->rootId >= 0 && g_items[c->rootId].fromFS) lstrcpynW(destDir, g_items[c->rootId].path, MAX_PATH); else if (g_fsRootPath[0]) lstrcpynW(destDir, g_fsRootPath, MAX_PATH); }
+                if (destDir[0]) { 
+                    size_t reqSize = 2;
+                    for (int i=0; i<count; i++) {
+                        wchar_t tmp[MAX_PATH];
+                        DragQueryFileW(hDrop, i, tmp, MAX_PATH);
+                        reqSize += lstrlenW(tmp) + 1;
+                    }
+                    wchar_t* multi = (wchar_t*)LocalAlloc(LMEM_FIXED, reqSize * sizeof(wchar_t)); 
+                    if (multi) {
+                        wchar_t* ptr = multi; for(int i=0; i<count; i++) { DragQueryFileW(hDrop, i, ptr, MAX_PATH); ptr += lstrlenW(ptr) + 1; } *ptr = 0; 
+                        StartFileOperation(FO_COPY, multi, destDir, h); 
+                        LocalFree(multi); 
+                    }
+                }
+            } DragFinish(hDrop);
+        } return 0;
+        case WM_HOTKEY: { if (w == 99) { ShellExecuteW(NULL, L"open", L"explorer.exe", L"shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", NULL, SW_SHOWNORMAL); } } return 0;
+        case WM_ERASEBKGND: return 1;
+        case WM_APP+1: { 
+            wchar_t q[512]; q[0] = 0; if (g_tbSearchEdit) GetWindowTextW(g_tbSearchEdit, q, 511);
+            if (q[0] == 0) { Layout L; ComputeLayout(h, &L); for (int i = 0; i < g_itemCount; ++i) if (g_items[i].parent == c->rootId) g_items[i].selected = FALSE; InvalidateRect(h, NULL, FALSE); return 0; }
+            
+            DWORD attr = GetFileAttributesW(q);
+            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                Layout L; ComputeLayout(h, &L);
+                if (g_navDepth < 9) { 
+                    g_navDepth++; lstrcpynW(g_navHistory[g_navDepth], q, MAX_PATH); 
+                    c->rootId = -1; FS_PopulateRootFromPath(q, &L); SetupDirectoryMonitor(h, c, q); c->scrollY = 0; 
+                }
+                InvalidateRect(h, NULL, TRUE);
+                if (g_tbSearchEdit) SetWindowTextW(g_tbSearchEdit, L"");
+                return 0;
+            }
+
+            SearchQuery sq; ParseQuery(q, &sq);
+            if (sq.isAdvanced) {
+                if (g_isSearchRunning) { g_isSearchRunning = FALSE; Sleep(10); } g_isSearchRunning = TRUE;
+                SearchTask* task = (SearchTask*)LocalAlloc(LMEM_FIXED, sizeof(SearchTask)); task->sq = sq; task->hwndNotify = h; task->pRunningFlag = &g_isSearchRunning; lstrcpynW(task->startDir, L"ALL", MAX_PATH); CreateThread(NULL, 0, SearchThread, task, 0, NULL);
+            } else { Layout L; ComputeLayout(h, &L); for (int i = 0; i < g_itemCount; ++i) { if (g_items[i].parent == c->rootId && g_items[i].type != IT_TRASH) { if (wcschr(sq.pattern, L'*') || wcschr(sq.pattern, L'?')) { g_items[i].selected = PathMatchSpecW(g_items[i].name, sq.pattern); } else { g_items[i].selected = (wcsistr(g_items[i].name, q) != NULL); } } } InvalidateRect(h, NULL, FALSE); }
+        } return 0;
+        case WM_APP+5: {
+            SearchResultItem* pResults = (SearchResultItem*)w; int count = (int)l; Layout L; ComputeLayout(h, &L); FS_ClearChildren(-2); c->rootId = -2;
+            if (g_navDepth < 9 && lstrcmpW(g_navHistory[g_navDepth], L":Search:") != 0) { g_navDepth++; lstrcpynW(g_navHistory[g_navDepth], L":Search:", MAX_PATH); }
+            for (int i = 0; i < count; ++i) { AddItemFS(pResults[i].isDir ? IT_FOLDER : IT_FILE, pResults[i].name, pResults[i].path, -1, -1, -2, &L, !pResults[i].isDir); }
+            if (pResults) LocalFree(pResults); 
+            c->scrollY = 0; InvalidateRect(h, NULL, TRUE);
+        } return 0;
+        case WM_APP+6: { ShowFavoritesMenu(h); return 0; }
+        case WM_KEYDOWN: {
+            if (w == VK_BACK) { if (g_navDepth > 0) { c->elevAnimActive = TRUE; c->elevTargetDepth = g_navDepth - 1; Layout L; ComputeLayout(h, &L); c->elevCurY = L.annex.top + S(20) + g_navDepth * S(30); SetTimer(h, 6, 16, NULL); } return 0; }
+            if (w == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) { PostMessageW(h, WM_COMMAND, CMD_COPY, 0); return 0; }
+            if (w == 'X' && (GetKeyState(VK_CONTROL) & 0x8000)) { PostMessageW(h, WM_COMMAND, CMD_CUT, 0); return 0; }
+            if (w == 'V' && (GetKeyState(VK_CONTROL) & 0x8000)) { PostMessageW(h, WM_COMMAND, CMD_PASTE, 0); return 0; }
+        } break;
+        case WM_MOUSEWHEEL: {
+            if (GetKeyState(VK_CONTROL) & 0x8000) { int delta = GET_WHEEL_DELTA_WPARAM(w); g_iconScale += (delta > 0) ? 0.1f : -0.1f; if (g_iconScale < 0.5f) g_iconScale = 0.5f; if (g_iconScale > 3.0f) g_iconScale = 3.0f; InvalidateRect(h, NULL, TRUE); return 0; }
+            int delta = GET_WHEEL_DELTA_WPARAM(w); c->scrollY -= (delta / WHEEL_DELTA) * S(40); Layout L; ComputeLayout(h, &L); UpdateScrollBounds(c, &L); InvalidateRect(h, NULL, FALSE);
+        } return 0;
+        case WM_TIMER: {
+            if (w==100) { if (c->hDirMonitor && c->hDirMonitor != INVALID_HANDLE_VALUE) { if (WaitForSingleObject(c->hDirMonitor, 0) == WAIT_OBJECT_0) { FindNextChangeNotification(c->hDirMonitor); PostMessageW(h, WM_APP+2, 0, 0); } } return 0; }
+            if (w==6) { Layout L; ComputeLayout(h, &L); float targetY = L.annex.top + S(20) + c->elevTargetDepth * S(30); c->elevCurY += (targetY - c->elevCurY) * 0.2f; if (fabs(targetY - c->elevCurY) < 1.0f) { g_navDepth = c->elevTargetDepth; c->elevAnimActive = FALSE; KillTimer(h, 6); if (lstrcmpW(g_navHistory[g_navDepth], L":Search:") == 0) { c->rootId = -2; } else { c->rootId = -1; FS_PopulateRootFromPath(g_navHistory[g_navDepth], &L); SetupDirectoryMonitor(h, c, g_navHistory[g_navDepth]); } } InvalidateRect(h, NULL, FALSE); return 0; }
+            if (w==7 && c->moveAnimActive) { 
+                c->moveStep += 0.08f; 
+                if (c->moveStep >= 1.0f) { 
+                    c->moveAnimActive = FALSE; KillTimer(h, 7); 
+                    int dropHit = c->moveDstIdx; 
+                    size_t reqSize = 2;
+                    for (int i = g_itemCount - 1; i >= 0; --i) {
+                        if (g_items[i].parent == c->rootId && g_items[i].selected && g_items[i].type != IT_TRASH && i != dropHit) {
+                            reqSize += lstrlenW(g_items[i].path) + 1;
+                        }
+                    }
+                    wchar_t* multiSrc = (wchar_t*)LocalAlloc(LMEM_FIXED, reqSize * sizeof(wchar_t));
+                    if (multiSrc) {
+                        wchar_t* pSrc = multiSrc; BOOL anyFS = FALSE; 
+                        for (int i = g_itemCount - 1; i >= 0; --i) { 
+                            if (g_items[i].parent == c->rootId && g_items[i].selected && g_items[i].type != IT_TRASH && i != dropHit) { 
+                                if (g_items[i].fromFS && g_items[dropHit].fromFS) { 
+                                    lstrcpyW(pSrc, g_items[i].path); pSrc += lstrlenW(pSrc) + 1; anyFS = TRUE; 
+                                } else { 
+                                    g_items[i].parent = dropHit; 
+                                } 
+                            } 
+                        } 
+                        *pSrc = 0; 
+                        if (anyFS) StartFileOperation(FO_MOVE, multiSrc, g_items[dropHit].path, h); 
+                        ClearSelection(c->rootId); 
+                        LocalFree(multiSrc);
+                    }
+                } 
+                InvalidateRect(h, NULL, FALSE); 
+                return 0; 
+            }
+            if (w==2001) { g_ttVisible = (g_ttItem>=0); KillTimer(h,2001); if (g_ttVisible) SetTimer(h,2002,4000,NULL); InvalidateRect(h,NULL,FALSE); return 0; }
+            if (w==2002) { g_ttVisible = FALSE; KillTimer(h,2002); InvalidateRect(h,NULL,FALSE); return 0; }
+            if (c->copyActive && w==4) { c->copyStep++; if (c->copyStep>10) { c->copyActive=FALSE; KillTimer(h,4); } InvalidateRect(h, NULL, FALSE); return 0; }
+            Layout L; ComputeLayout(h, &L);
+            if (c->delActive && w==2) { 
+                c->delStep++; 
+                if (c->delStep>20) { 
+                    c->delActive=FALSE; KillTimer(h,2); 
+                    size_t reqSize = 2;
+                    for (int i = g_itemCount - 1; i >= 0; --i) {
+                        if (g_items[i].parent == c->rootId && g_items[i].selected && g_items[i].type != IT_TRASH) {
+                            reqSize += lstrlenW(g_items[i].path) + 1;
+                        }
+                    }
+                    wchar_t* multiSrc = (wchar_t*)LocalAlloc(LMEM_FIXED, reqSize * sizeof(wchar_t));
+                    if (multiSrc) {
+                        wchar_t* pSrc = multiSrc; BOOL anyFS = FALSE; 
+                        for (int i = g_itemCount - 1; i >= 0; --i) { 
+                            if (g_items[i].parent == c->rootId && g_items[i].selected && g_items[i].type != IT_TRASH) { 
+                                if (g_items[i].fromFS && g_items[i].path[0]) { 
+                                    lstrcpyW(pSrc, g_items[i].path); pSrc += lstrlenW(pSrc) + 1; anyFS = TRUE; 
+                                } 
+                                DeleteItem(i); 
+                            } 
+                        } 
+                        *pSrc = 0; 
+                        if (anyFS) StartFileOperation(FO_DELETE, multiSrc, NULL, h); 
+                        else InvalidateRect(h, NULL, TRUE); 
+                        LocalFree(multiSrc);
+                    } else InvalidateRect(h, NULL, TRUE);
+                } 
+                InvalidateRect(h, NULL, FALSE); 
+            } else if (c->openActive && w==3) { c->openStep++; int steps=10; RECT r = c->openRect; int dx = (L.content.left - r.left)/ (steps - c->openStep + 1); int dy = (L.content.top  - r.top )/ (steps - c->openStep + 1); int dw = ((L.content.right - L.content.left) - (r.right - r.left))/ (steps - c->openStep + 1); int dh = ((L.content.bottom- L.content.top ) - (r.bottom- r.top ))/ (steps - c->openStep + 1); OffsetRect(&r, dx, dy); r.right += dw; r.bottom += dh; c->openRect = r; if (c->openStep>=steps) { c->openActive=FALSE; KillTimer(h,3); } InvalidateRect(h, NULL, FALSE); }
+        } return 0;
+        case WM_DPICHANGED: { UINT dpiY = HIWORD(w); dpi_scale = dpiY / 96.0f; RECT* prc = (RECT*)l; if (prc) { SetWindowPos(h, NULL, prc->left, prc->top, prc->right-prc->left, prc->bottom-prc->top, SWP_NOZORDER|SWP_NOACTIVATE); } InvalidateRect(h, NULL, TRUE); } return 0;
+        case WM_SIZE: InvalidateRect(h, NULL, TRUE); return 0;
+        case WM_LBUTTONDBLCLK: {
+            if (c->renActive) { EndInlineRename(h, TRUE); } Layout L; ComputeLayout(h, &L); int mx = GET_X_LPARAM(l), my = GET_Y_LPARAM(l); int hit = HitTestItem(&L, c, mx, my);
+            if (hit>=0) {
+                if (g_items[hit].type==IT_FOLDER || g_items[hit].type==IT_GROUP) {
+                    RECT rI,rL; ItemPixelRect(&L, c, &g_items[hit], &rI, &rL); c->openActive=TRUE; c->openStep=0; c->openRect = rI; SetTimer(h,3,16,NULL);
+                    if (g_items[hit].fromFS && g_items[hit].path[0]) { if (g_navDepth < 9) { g_navDepth++; lstrcpynW(g_navHistory[g_navDepth], g_items[hit].path, MAX_PATH); c->rootId = -1; FS_PopulateRootFromPath(g_items[hit].path, &L); SetupDirectoryMonitor(h, c, g_items[hit].path); c->scrollY = 0; } }
+                } else if (g_items[hit].type==IT_FILE) {
+                    if (g_items[hit].fromFS && g_items[hit].path[0]) {
+                        if (!RunWithAssoc(g_items[hit].path)) ShellExecuteW(NULL, L"open", g_items[hit].path, NULL, NULL, SW_SHOWNORMAL);
+                    } else { POINT pt = { mx, my }; DoMiniDialog(h, L"Info", g_items[hit].name, g_items[hit].desc, pt); }
+                }
+            }
+        } return 0;
+        case WM_COMMAND: {
+            UINT cmd = LOWORD(w); Layout L; ComputeLayout(h, &L); POINT cur; GetCursorPos(&cur); ScreenToClient(h, &cur); int hit = HitTestItem(&L, c, cur.x, cur.y);
+            if (cmd == CMD_COPY || cmd == CMD_CUT || cmd == CMD_PASTE || cmd == CMD_DELETE || cmd == CMD_RENAME) { if (hit < 0) { for (int i=0; i<g_itemCount; ++i) if (g_items[i].parent == c->rootId && g_items[i].selected && g_items[i].type!=IT_TRASH) { hit = i; break; } } }
+            if (cmd == CMD_COMPUTER) { if (g_navDepth < 9) { g_navDepth++; lstrcpynW(g_navHistory[g_navDepth], L":Computer:", MAX_PATH); c->rootId = -1; FS_PopulateRootFromPath(L":Computer:", &L); SetupDirectoryMonitor(h, c, L":Computer:"); c->scrollY = 0; InvalidateRect(h, NULL, TRUE); } return 0; }
+            if (cmd == CMD_REFRESH) { PostMessageW(h, WM_APP+2, 0, 0); return 0; }
+            if (cmd == CMD_SORT_NAME || cmd == CMD_SORT_DATE || cmd == CMD_SORT_SIZE) {
+                Item* temp = (Item*)LocalAlloc(LMEM_FIXED, sizeof(Item) * g_itemCount);
+                int cnt = 0;
+                for (int i = g_itemCount - 1; i >= 0; --i) {
+                    if (g_items[i].parent == c->rootId && g_items[i].type != IT_TRASH) {
+                        temp[cnt++] = g_items[i];
+                        DeleteItem(i);
+                    }
+                }
+                if (cmd == CMD_SORT_NAME) qsort(temp, cnt, sizeof(Item), CmpItemName);
+                else if (cmd == CMD_SORT_DATE) qsort(temp, cnt, sizeof(Item), CmpItemDate);
+                else if (cmd == CMD_SORT_SIZE) qsort(temp, cnt, sizeof(Item), CmpItemSize);
+
+                int originX = L.content.left + L.xStart;
+                int usableW = L.content.right - originX;
+                int cols = max(1, usableW / L.colW);
+                for (int i = 0; i < cnt; i++) {
+                    temp[i].gridCol = i % cols;
+                    temp[i].gridRow = i / cols;
+                    g_items[g_itemCount++] = temp[i];
+                }
+                LocalFree(temp);
+                InvalidateRect(h, NULL, TRUE);
+                return 0;
+            }
+            if (cmd==CMD_RENAME && hit>=0 && g_items[hit].type!=IT_TRASH) { BeginInlineRename(h, &L, c, hit); } 
+            else if (cmd==CMD_DELETE) { c->delActive = TRUE; c->delStep = 0; SetTimer(h, 2, 16, NULL); if (g_topBar) PostMessageW(g_topBar, WM_APP+10, 0, 0); } 
+            else if (cmd==CMD_NEW_FOLDER || cmd==CMD_NEW_FILE || cmd==CMD_NEW_GROUP) {
+                POINT at = { cur.x, cur.y }; ClientToScreen(h, &at); const wchar_t* defN = (cmd==CMD_NEW_FOLDER)?L"New Folder":(cmd==CMD_NEW_FILE)?L"New File.txt":L"New Group";
+                if (DoMiniDialog(h, L"Create", defN, L"", at)) {
+                    int col=-1,row=-1; ItemType t = (cmd==CMD_NEW_FOLDER)?IT_FOLDER:(cmd==CMD_NEW_FILE)?IT_FILE:IT_GROUP;
+                    if (t==IT_GROUP) { int anchorCol = 0, anchorRow = 0; BOOL haveAnchor = FALSE; for (int i=0;i<g_itemCount;++i) if (g_items[i].parent==c->rootId && g_items[i].selected && g_items[i].type!=IT_TRASH) { if (!haveAnchor) { anchorCol = g_items[i].gridCol; anchorRow = g_items[i].gridRow; haveAnchor = TRUE; } else if (g_items[i].gridRow < anchorRow || (g_items[i].gridRow==anchorRow && g_items[i].gridCol < anchorCol)) { anchorCol = g_items[i].gridCol; anchorRow = g_items[i].gridRow; } } if (haveAnchor) { col = anchorCol; row = anchorRow; } }
+                    BOOL onFS = FALSE; wchar_t baseDir[MAX_PATH] = L"";
+                    if (c->rootId>=0 && g_items[c->rootId].fromFS && g_items[c->rootId].type==IT_FOLDER) { lstrcpynW(baseDir, g_items[c->rootId].path, MAX_PATH-1); onFS = TRUE; } else if (c->rootId<0 && g_fsRootPath[0] && lstrcmpW(g_fsRootPath, L":Computer:")!=0 && lstrcmpW(g_fsRootPath, L":Search:")!=0) { lstrcpynW(baseDir, g_fsRootPath, MAX_PATH-1); onFS = TRUE; }
+                    wchar_t createdFull[MAX_PATH] = L"";
+                    if (onFS && (t==IT_FOLDER || t==IT_FILE)) { BOOL ok = (t==IT_FOLDER) ? FS_CreateFolder(baseDir, g_lastDlg.name, createdFull) : FS_CreateEmptyFile(baseDir, g_lastDlg.name, createdFull); if (ok) { if (t==IT_FOLDER) AddItemFS(IT_FOLDER, wcsrchr(createdFull, L'\\')? wcsrchr(createdFull, L'\\')+1 : g_lastDlg.name, createdFull, col, row, c->rootId, &L, FALSE); else AddItemFS(IT_FILE, wcsrchr(createdFull, L'\\')? wcsrchr(createdFull, L'\\')+1 : g_lastDlg.name, createdFull, col, row, c->rootId, &L, TRUE); goto __skip_inmem_additem; } else MessageBoxW(h, L"Cannot create on this path.", L"Error", MB_ICONERROR); }
+                    AddItem(t, g_lastDlg.name, g_lastDlg.desc, col, row, c->rootId, &L);
+__skip_inmem_additem: ;
+                    if (t==IT_GROUP) { int gid = g_itemCount-1; for (int i=0;i<g_itemCount;++i) if (g_items[i].parent==c->rootId && g_items[i].selected && i!=gid && g_items[i].type!=IT_TRASH) g_items[i].parent = gid; ClearSelection(c->rootId); } InvalidateRect(h, NULL, TRUE);
+                }
+            } else if (cmd==CMD_REMOVE_FROM_GROUP && hit>=0) { int par = g_items[hit].parent; if (par>=0 && g_items[par].type==IT_GROUP) { int col,row; SnapToGrid(&L, c, &col, &row, cur.x, cur.y, hit); g_items[hit].parent = g_items[par].parent; g_items[hit].gridCol = col; g_items[hit].gridRow = row; InvalidateRect(h, NULL, TRUE); } } else if (cmd == CMD_COPY || cmd == CMD_CUT) {
+                size_t reqSize = 32;
+                for (int i = 0; i < g_itemCount; ++i) { 
+                    if (g_items[i].parent == c->rootId && g_items[i].selected && g_items[i].type != IT_TRASH) { 
+                        const wchar_t* what = (g_items[i].fromFS && g_items[i].path[0]) ? g_items[i].path : (g_items[i].name[0] ? g_items[i].name : L""); 
+                        reqSize += lstrlenW(what) + 2;
+                    }
+                }
+                wchar_t* clipBuf = (wchar_t*)LocalAlloc(LMEM_FIXED, reqSize * sizeof(wchar_t)); 
+                if (clipBuf) {
+                    lstrcpyW(clipBuf, (cmd == CMD_CUT) ? L"*MOVE*\n" : L"*COPY*\n");
+                    BOOL hasAny = FALSE;
+                    for (int i = 0; i < g_itemCount; ++i) { 
+                        if (g_items[i].parent == c->rootId && g_items[i].selected && g_items[i].type != IT_TRASH) { 
+                            const wchar_t* what = (g_items[i].fromFS && g_items[i].path[0]) ? g_items[i].path : (g_items[i].name[0] ? g_items[i].name : L""); 
+                            lstrcatW(clipBuf, what); lstrcatW(clipBuf, L"\n"); hasAny = TRUE; 
+                        } 
+                    }
+                    if (hasAny) { SetClipboardText(h, clipBuf); c->copyActive = TRUE; c->copyStep = 0; SetTimer(h, 4, 16, NULL); } 
+                    LocalFree(clipBuf);
+                }
+            } else if (cmd == CMD_PASTE) {
+                BOOL pastedFS = FALSE;
+                if (OpenClipboard(h)) { 
+                    HANDLE htxt = GetClipboardData(CF_UNICODETEXT); 
+                    if (htxt) { 
+                        const wchar_t* p = (const wchar_t*)GlobalLock(htxt); 
+                        if (p) { 
+                            BOOL isMove = FALSE; const wchar_t* data = p;
+                            if (wcsncmp(p, L"*MOVE*\n", 7) == 0) { isMove = TRUE; data += 7; }
+                            else if (wcsncmp(p, L"*COPY*\n", 7) == 0) { data += 7; }
+
+                            wchar_t destDir[MAX_PATH]; destDir[0]=0; 
+                            if (c->rootId>=0 && g_items[c->rootId].fromFS) lstrcpynW(destDir, g_items[c->rootId].path, MAX_PATH); 
+                            else if (c->rootId<0 && g_fsRootPath[0]) lstrcpynW(destDir, g_fsRootPath, MAX_PATH); 
+                            if (destDir[0] && lstrcmpW(destDir, L":Computer:")!=0 && lstrcmpW(destDir, L":Search:")!=0) { 
+                                if (DoPasteIntoDirViaProgress(h, destDir, data, isMove)) { pastedFS = TRUE; } 
+                            } 
+                            GlobalUnlock(htxt); 
+                        } 
+                    } 
+                    CloseClipboard(); 
+                }
+                if (!pastedFS) MessageBoxW(h, L"Cannot paste files here.", L"Error", MB_ICONERROR);
+            } else if (cmd == CMD_CREATE_SHORTCUT) {
+                for (int i=0; i<g_itemCount; ++i) { if (g_items[i].parent == c->rootId && g_items[i].selected && g_items[i].fromFS) { wchar_t linkPath[MAX_PATH]; FS_PathJoin(linkPath, c->rootId>=0 ? g_items[c->rootId].path : g_fsRootPath, g_items[i].name); wchar_t* dot = wcsrchr(linkPath, L'.'); if (dot) *dot = 0; lstrcatW(linkPath, L" - Shortcut.lnk"); CreateLink(g_items[i].path, linkPath, L""); } } PostMessageW(h, WM_APP+2, 0, 0);
+            } else if (cmd==CMD_PROPERTIES) {
+                if (hit>=0) {
+                    ULONGLONG sz = 0, mx = 0; double pct = 0.0;
+                    if (g_items[hit].type==IT_FILE && g_items[hit].fromFS) sz = FS_GetFileSizeBytes(g_items[hit].path);
+                    for (int i=0; i<g_itemCount; ++i) { if (g_items[i].parent != c->rootId) continue; if (g_items[i].type != IT_FILE || !g_items[i].fromFS) continue; ULONGLONG szi = FS_GetFileSizeBytes(g_items[i].path); if (szi > mx) mx = szi; }
+                    if (mx>0 && sz>0) pct = (double)sz*100.0/(double)mx;
+                    wchar_t sizeStr[256]; FS_FormatSizeDual(sz, sizeStr, 256); PropsData pd = {0}; lstrcpynW(pd.name, g_items[hit].name, 255); lstrcpynW(pd.typeStr, (g_items[hit].type==IT_FOLDER?L"Folder": (g_items[hit].type==IT_FILE?L"File": (g_items[hit].type==IT_GROUP?L"Group":L"Other"))), 63); lstrcpynW(pd.path, g_items[hit].path[0]?g_items[hit].path:L"", MAX_PATH-1); lstrcpynW(pd.desc, g_items[hit].desc[0]?g_items[hit].desc:L"", 511); lstrcpynW(pd.sizeStr, sizeStr, 255); pd.pctOfMax = pct;
+                    ULONGLONG totalFiles=0, rank=0; if (sz>0 && g_items[hit].path[0]) FS_ComputeDiskRank(g_items[hit].path, sz, &totalFiles, &rank);
+                    if (totalFiles>0 && rank>0) { double topPct = 100.0 * (double)rank / (double)totalFiles; _snwprintf(pd.topLine, 255, L"№ %llu из %llu (%.2f%%)", (unsigned long long)rank, (unsigned long long)totalFiles, topPct); pd.topLine[255]=0; } else lstrcpyW(pd.topLine, L"(нет данных)");
+                    
+                    if (g_items[hit].fromFS && g_items[hit].path[0]) {
+                        WIN32_FILE_ATTRIBUTE_DATA fad;
+                        if (GetFileAttributesExW(g_items[hit].path, GetFileExInfoStandard, &fad)) {
+                            FormatFileTimeStr(&fad.ftCreationTime, pd.created, 128); FormatFileTimeStr(&fad.ftLastWriteTime, pd.modified, 128);
+                            wchar_t att[64] = L""; if(fad.dwFileAttributes & FILE_ATTRIBUTE_READONLY) lstrcatW(att, L"R "); if(fad.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) lstrcatW(att, L"H "); if(fad.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) lstrcatW(att, L"S "); if(!att[0]) lstrcpyW(att, L"Normal"); lstrcpynW(pd.attribs, att, 63);
+                        } else { lstrcpyW(pd.created, L"N/A"); lstrcpyW(pd.modified, L"N/A"); lstrcpyW(pd.attribs, L"N/A"); }
+                    } else { lstrcpyW(pd.created, L"-"); lstrcpyW(pd.modified, L"-"); lstrcpyW(pd.attribs, L"-"); }
+                    
+                    ShowPropertiesWindow(h, &pd);
+                } return 0;
+            }
+        } return 0;
+        case WM_LBUTTONDOWN: {
+            if (c->renActive) { POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) }; HWND hChild = ChildWindowFromPoint(h, p); if (hChild != c->renEdit) EndInlineRename(h, TRUE); }
+            Layout L; ComputeLayout(h, &L); int mx = GET_X_LPARAM(l), my = GET_Y_LPARAM(l);
+            if (PtIn(&L.closeBox, mx, my)) { DestroyWindow(h); return 0; } if (PtIn(&L.titleBar, mx, my)) { ReleaseCapture(); SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, 0); return 0; } if (PtIn(&L.growBox, mx, my)) { resizing = TRUE; SetCapture(h); resizeStartMouse.x = mx; resizeStartMouse.y = my; RECT wr; GetWindowRect(h, &wr); resizeStartWnd = wr; return 0; }
+            int elX = L.annex.left + S(24); int elY_start = L.annex.top + S(20); int elSpacing = S(30); int rad = S(6);
+            for(int i=0; i<=g_navDepth; i++) { int cy = elY_start + i * elSpacing; RECT cr = { elX - rad*2, cy - rad*2, elX + rad*2, cy + rad*2 }; if (PtIn(&cr, mx, my)) { if (i < g_navDepth) { c->elevAnimActive = TRUE; c->elevTargetDepth = i; c->elevCurY = L.annex.top + S(20) + g_navDepth * S(30); SetTimer(h, 6, 16, NULL); } return 0; } }
+            if (PtIn(&L.scrollRect, mx, my)) { 
+                UpdateScrollBounds(c, &L); 
+                RECT rTop = {L.scrollRect.left, L.scrollRect.top, L.scrollRect.right, L.scrollRect.top+S(16)}; 
+                RECT rBot = {L.scrollRect.left, L.scrollRect.bottom-S(16), L.scrollRect.right, L.scrollRect.bottom}; 
+                RECT rTrack = {L.scrollRect.left, L.scrollRect.top+S(16), L.scrollRect.right, L.scrollRect.bottom-S(16)}; 
+                if (PtIn(&rTop, mx, my)) { c->scrollY -= S(40); UpdateScrollBounds(c, &L); InvalidateRect(h, NULL, FALSE); return 0; } 
+                if (PtIn(&rBot, mx, my)) { c->scrollY += S(40); UpdateScrollBounds(c, &L); InvalidateRect(h, NULL, FALSE); return 0; } 
+                if (PtIn(&rTrack, mx, my)) { 
+                    c->scrollDragging = TRUE; 
+                    c->scrollDragStartMouseY = my; 
+                    c->scrollDragStartOffY = c->scrollY; 
+                    SetCapture(h); 
+                } 
+                return 0; 
+            }
+            int hit = HitTestItem(&L, c, mx, my); 
+            if (hit >= 0) {
+                BOOL inCheckbox = FALSE; RECT rI, rL; ItemPixelRect(&L, c, &g_items[hit], &rI, &rL);
+                if (g_multiSelectMode) { int s = S(14); RECT chk = { rI.left - S(4), rI.top - S(4), rI.left - S(4) + s, rI.top - S(4) + s }; if (PtIn(&chk, mx, my)) inCheckbox = TRUE; }
+                if (inCheckbox) { g_items[hit].selected = !g_items[hit].selected; InvalidateRect(h, NULL, FALSE); return 0; }
+                
+                if (g_multiSelectMode || (GetKeyState(VK_CONTROL) & 0x8000)) { 
+                    if (!g_items[hit].selected) g_items[hit].selected = TRUE; 
+                } else if (!g_items[hit].selected) { 
+                    ClearSelection(c->rootId); g_items[hit].selected = TRUE; 
+                }
+                c->dragIdx = hit; c->dragging = TRUE; 
+                c->dragOff.x = mx - rI.left; c->dragOff.y = my - rI.top; 
+                c->dragAt.x = rI.left; c->dragAt.y = rI.top; 
+                SetCapture(h); InvalidateRect(h, NULL, FALSE);
+                return 0;
+            } else { 
+                ClearSelection(c->rootId); c->lasso = TRUE; c->lassoRect.left = c->lassoRect.right = mx; c->lassoRect.top = c->lassoRect.bottom = my; SetCapture(h); InvalidateRect(h, NULL, FALSE); 
+            }
+        } return 0;
+        case WM_MOUSEMOVE: {
+            Layout L; ComputeLayout(h, &L); int over = HitTestItem(&L, c, GET_X_LPARAM(l), GET_Y_LPARAM(l)); if (over != g_ttItem) { g_ttItem = over; g_ttVisible = FALSE; KillTimer(h,2002); KillTimer(h,2001); if (over>=0) SetTimer(h,2001,2000,NULL); } g_ttPos.x = GET_X_LPARAM(l); g_ttPos.y = GET_Y_LPARAM(l); int mx = GET_X_LPARAM(l), my = GET_Y_LPARAM(l);
+            if (resizing) { int dx = mx - resizeStartMouse.x; int dy = my - resizeStartMouse.y; int newW = (resizeStartWnd.right - resizeStartWnd.left) + dx; int newH = (resizeStartWnd.bottom - resizeStartWnd.top) + dy; if (newW < S(360)) { newW = S(360); } if (newH < S(300)) { newH = S(300); } SetWindowPos(h, NULL, resizeStartWnd.left, resizeStartWnd.top, newW, newH, SWP_NOZORDER|SWP_NOMOVE); return 0; }
+            if (c->scrollDragging) { 
+                RECT rTop = {L.scrollRect.left, L.scrollRect.top, L.scrollRect.right, L.scrollRect.top+S(16)}; 
+                RECT rBot = {L.scrollRect.left, L.scrollRect.bottom-S(16), L.scrollRect.right, L.scrollRect.bottom}; 
+                int trackH = rBot.top - rTop.bottom; int viewH = L.content.bottom - L.content.top; int contentH = viewH + c->maxScroll; 
+                int thumbH = max(S(16), (int)((viewH / (float)contentH) * trackH)); int usableTrack = trackH - thumbH; 
+                if (usableTrack > 0) { 
+                    int dy = my - c->scrollDragStartMouseY; 
+                    c->scrollY = c->scrollDragStartOffY + (int)((dy / (float)usableTrack) * c->maxScroll); 
+                    UpdateScrollBounds(c, &L); 
+                    InvalidateRect(h, NULL, FALSE); 
+                } 
+                return 0; 
+            }
+            if (c->dragging && c->dragIdx>=0) { c->dragAt.x = mx - c->dragOff.x; c->dragAt.y = my - c->dragOff.y; InvalidateRect(h, NULL, FALSE); return 0; }
+            if (c->lasso) { c->lassoRect.right = mx; c->lassoRect.bottom = my; InvalidateRect(h, NULL, FALSE); return 0; }
+        } return 0;
+        case WM_LBUTTONUP: {
+            ReleaseCapture(); Layout L; ComputeLayout(h, &L); if (resizing) { resizing = FALSE; return 0; } if (c->scrollDragging) { c->scrollDragging = FALSE; return 0; }
+            if (c->dragging && c->dragIdx>=0) {
+                POINT scr = { GET_X_LPARAM(l), GET_Y_LPARAM(l) }; ClientToScreen(h, &scr);
+                if (TopBar_PointInTrash(scr) && c->dragIdx!=g_trashIndex) { PostMessageW(h, WM_COMMAND, CMD_DELETE, 0); } 
+                else {
+                    int dropHit = HitTestItem(&L, c, GET_X_LPARAM(l), GET_Y_LPARAM(l));
+                    if (dropHit >= 0 && !g_items[dropHit].selected && (g_items[dropHit].type == IT_FOLDER || g_items[dropHit].type == IT_GROUP)) { c->moveAnimActive = TRUE; c->moveDstIdx = dropHit; c->moveStep = 0.0f; SetTimer(h, 7, 16, NULL); } else { int col=0,row=0; SnapToGrid(&L, c, &col, &row, c->dragAt.x, c->dragAt.y, c->dragIdx); if (c->dragIdx != g_trashIndex && c->dragIdx >= 0) { g_items[c->dragIdx].gridCol=col; g_items[c->dragIdx].gridRow=row; } }
+                }
+            } else if (c->lasso) { RECT r = c->lassoRect; if (r.left>r.right){int t=r.left;r.left=r.right;r.right=t;} if (r.top>r.bottom){int t=r.top;r.top=r.bottom;r.bottom=t;} for (int i=0;i<g_itemCount;++i) if (g_items[i].parent==c->rootId && g_items[i].type!=IT_TRASH) { RECT ri, rl; ItemPixelRect(&L, c, &g_items[i], &ri, &rl); RECT rr = ri; InflateRect(&rr, S(6), S(6)); rr.bottom = rl.bottom+S(6); if (!(rr.right < r.left || rr.left > r.right || rr.bottom < r.top || rr.top > r.bottom)) g_items[i].selected = TRUE; } } c->dragging=FALSE; c->dragIdx=-1; c->lasso=FALSE; UpdateScrollBounds(c, &L); InvalidateRect(h, NULL, FALSE);
+        } return 0;
+        case WM_RBUTTONUP: {
+            Layout L; ComputeLayout(h, &L); int mx = GET_X_LPARAM(l), my = GET_Y_LPARAM(l); int hit = HitTestItem(&L, c, mx, my);
+            if (hit >= 0 && !g_items[hit].selected) { if (!g_multiSelectMode) ClearSelection(c->rootId); g_items[hit].selected = TRUE; InvalidateRect(h, NULL, FALSE); }
+            MenuItem items[15]; int n=0; items[n++] = (MenuItem){L"Properties", CMD_PROPERTIES, hit>=0};
+            if (hit>=0 && g_items[hit].type!=IT_TRASH) { items[n++] = (MenuItem){L"Rename", CMD_RENAME, TRUE}; items[n++] = (MenuItem){L"Delete", CMD_DELETE, TRUE}; items[n++] = (MenuItem){L"Cut", CMD_CUT, TRUE}; items[n++] = (MenuItem){L"Copy", CMD_COPY, TRUE}; items[n++] = (MenuItem){L"Create Shortcut", CMD_CREATE_SHORTCUT, TRUE}; if (g_items[hit].parent>=0 && g_items[g_items[hit].parent].type==IT_GROUP) { items[n++] = (MenuItem){L"Remove from Group", CMD_REMOVE_FROM_GROUP, TRUE}; } }
+            items[n++] = (MenuItem){L"Paste", CMD_PASTE, TRUE}; items[n++] = (MenuItem){L"Create Folder", CMD_NEW_FOLDER, TRUE}; items[n++] = (MenuItem){L"Create File",   CMD_NEW_FILE,   TRUE}; items[n++] = (MenuItem){L"Create Group",  CMD_NEW_GROUP,  TRUE}; items[n++] = (MenuItem){L"Computer",  CMD_COMPUTER,  TRUE};
+            items[n++] = (MenuItem){L"Refresh", CMD_REFRESH, TRUE}; items[n++] = (MenuItem){L"Sort by Date", CMD_SORT_DATE, TRUE}; items[n++] = (MenuItem){L"Sort by Name", CMD_SORT_NAME, TRUE}; items[n++] = (MenuItem){L"Sort by Size", CMD_SORT_SIZE, TRUE};
+            POINT pt = { mx, my }; ClientToScreen(h, &pt); UINT sel = ShowMacMenu(h, pt, items, n); if (sel) PostMessage(h, WM_COMMAND, sel, 0);
+        } return 0;
+        case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); Layout L; ComputeLayout(h, &L); UpdateScrollBounds(c, &L); HDC mem = CreateCompatibleDC(dc); HBITMAP bmp = CreateCompatibleBitmap(dc, L.client.right, L.client.bottom); HGDIOBJ old = SelectObject(mem, bmp); PaintAll(h, mem, &L); BitBlt(dc, 0, 0, L.client.right, L.client.bottom, mem, 0, 0, SRCCOPY); SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem); EndPaint(h, &ps); } return 0;
+        case WM_APP+2: {
+            Layout L; ComputeLayout(h, &L);
+            if (lstrcmpW(g_navHistory[g_navDepth], L":Search:") == 0) { c->rootId = -2; } else {
+                c->rootId = -1;
+                if (g_navDepth==0 && lstrcmpW(g_navHistory[0], L":Computer:")!=0) { wchar_t startDir[MAX_PATH]; GetDesktopPath(startDir); lstrcpynW(g_navHistory[0], startDir, MAX_PATH); FS_PopulateRootFromPath(startDir, &L); }
+                else FS_PopulateRootFromPath(g_navHistory[g_navDepth], &L); 
+            } InvalidateRect(h, NULL, TRUE);
+        } return 0;
+        case WM_DESTROY: { UnregisterHotKey(h, 99); if (c) { if(c->hDirMonitor) FindCloseChangeNotification(c->hDirMonitor); if (c->renFont) DeleteObject(c->renFont); HeapFree(GetProcessHeap(), 0, c); } g_windowCount--; if (g_windowCount<=0) PostQuitMessage(0); return 0; }
+    } return DefWindowProcW(h, m, w, l);
+}
+
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, PWSTR lpCmdLine, int nCmdShow) {
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED); g_hInst = hInst; SetDpiAware();
+    WNDCLASSW wc = {0}; wc.style = CS_HREDRAW|CS_VREDRAW|CS_DBLCLKS; wc.lpfnWndProc = WndProc; wc.hInstance = hInst; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName = kWndClass; RegisterClassW(&wc);
+    wc = (WNDCLASSW){0}; wc.lpfnWndProc = TopBarProc; wc.hInstance = hInst; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName = kTopBarClass; RegisterClassW(&wc);
+    int barW = S(720), barH = S(140); int sx = GetSystemMetrics(SM_CXSCREEN); int x = (sx - barW)/2;
+    g_topBar = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW, kTopBarClass, L"", WS_POPUP, x, S(10), barW, barH, NULL, NULL, hInst, NULL); ShowWindow(g_topBar, SW_SHOWNOACTIVATE); UpdateWindow(g_topBar);
+    
+    DWORD style = WS_POPUP; int W = S(760), H = S(500); 
+    int sx_main = GetSystemMetrics(SM_CXSCREEN);
+    int sy_main = GetSystemMetrics(SM_CYSCREEN);
+    HWND win = CreateWindowW(kWndClass, L"", style, (sx_main-W)/2, (sy_main-H)/2, W, H, NULL, NULL, hInst, NULL); 
+    ShowWindow(win, SW_SHOWDEFAULT); UpdateWindow(win);
+    
+    MSG msg; while (GetMessageW(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); } 
+    CoUninitialize(); return 0;
+}
