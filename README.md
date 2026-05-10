@@ -52,3 +52,7 @@ The built-in search console supports powerful console-like commands and modifier
 * **Top Size Sorting (`top`):** Find and filter the largest or smallest files in a directory.
   *Example:* `top 5 h` (returns the 5 *highest/largest* files).
   *Example:* `top 5 s` (returns the 5 *smallest* files).
+* **Examples syntax**
+top 5 s (small five files and folders)
+findall (@.png) (all png files)
+findall (@.exe) +100kb (all files exe more than 100kb size)
