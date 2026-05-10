@@ -1,3 +1,4 @@
+<img width="1313" height="745" alt="Screenshot_13" src="https://github.com/user-attachments/assets/772b54ee-009d-4186-8b9c-ffe585955e79" />
 # KI-file-manager
 a lightweight file manager somewhat similar to the system1 manager
 # Lightweight Windows File Manager
@@ -56,3 +57,18 @@ The built-in search console supports powerful console-like commands and modifier
 top 5 s (small five files and folders)
 findall (@.png) (all png files)
 findall (@.exe) +100kb (all files exe more than 100kb size)
+
+<img width="1313" height="745" alt="Screenshot_13" src="https://github.com/user-attachments/assets/a8dd0feb-db98-4781-92e1-42da9b6611e0" />
+Main theme
+
+<img width="280" height="176" alt="Screenshot_14" src="https://github.com/user-attachments/assets/7f78bf86-05d2-4062-b5d4-18d2267e20e5" /><img width="344" height="266" alt="Screenshot_15" src="https://github.com/user-attachments/assets/f320d846-5bdf-4b3c-a5d7-5364bec18a85" />
+Elevator works, you can tap on black poit if you want back
+
+<img width="622" height="681" alt="Screenshot_4" src="https://github.com/user-attachments/assets/f26c76a2-471c-446d-9f58-5fc14018dd9f" />
+Dont forget tap on chooser one more if you want remove check mark mode
+
+<img width="425" height="451" alt="Screenshot_6" src="https://github.com/user-attachments/assets/d844872f-2c68-4226-920a-1844387b7208" />
+context menu
+
+<img width="487" height="383" alt="Screenshot_7" src="https://github.com/user-attachments/assets/6b778eb5-fefc-4408-9139-f2a03d32615c" />
+Computer teleport you in disk view space
