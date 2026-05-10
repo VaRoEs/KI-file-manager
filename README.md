@@ -23,3 +23,32 @@ All major and critical bugs (including memory leaks during mass copying) have be
 
 ## 📄 License
 This project is open-source and available under the **MIT License**.
+
+## ⚙️ Advanced Configuration (Power User Bonuses)
+KI File Manager can be heavily customized using simple text files located in your `C:\` drive (or your User Profile directory). 
+
+* **Custom File Associations (`ki_assoc.txt`)**
+  You can manually map file extensions to specific executable programs for instant launching.
+  *Format:* `ID) AppName --C:\Path\to\app.exe-- .ext1 .ext2`
+  *Example:*
+  `1) Notepad --C:\Windows\notepad.exe-- .txt .ini .log .cfg`
+  `2) Explorer --C:\Windows\explorer.exe-- .exe .bat .cmd`
+
+* **Custom Favorites (`ki_favorites.txt`)**
+  Manage your starred/favorite directories for quick access from the UI.
+  *Format:* `DisplayName --C:\Path\to\folder--`
+  *Example:*
+  `KI --C:\Users\Sigrika\Desktop\ki--`
+  `PF --C:\Program Files (x86)--`
+
+## 🔍 Advanced Search Syntax
+The built-in search console supports powerful console-like commands and modifiers to find exactly what you need across your system:
+
+* **Global Search:** Type `findall` to search everywhere across all available drives.
+* **Wildcards & Boundaries:** Use parentheses `()` to set strict filename boundaries and `@` as a wildcard for unknown characters. 
+  *Example:* `(@.txt)` finds all `.txt` files.
+* **Size Filters:** Find files by size using `+` (greater than) or `-` (less than). Supported units: `b`, `kb`, `mb`, `gb`.
+  *Example:* `-500mb` (files smaller than 500 MB), `+2gb` (files larger than 2 GB).
+* **Top Size Sorting (`top`):** Find and filter the largest or smallest files in a directory.
+  *Example:* `top 5 h` (returns the 5 *highest/largest* files).
+  *Example:* `top 5 s` (returns the 5 *smallest* files).
