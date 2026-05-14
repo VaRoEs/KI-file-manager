@@ -58,6 +58,39 @@ top 5 s (small five files and folders)
 findall (@.png) (all png files)
 findall (@.exe) +100kb (all files exe more than 100kb size)
 
+## ⚙️ Configuration & Personalization
+
+KI File Manager is designed to be highly portable and customizable. All preferences are stored in simple plain-text files. By default, the application looks for these files in your **User Profile directory** (e.g., `C:\Users\YourName\`).
+
+### 📂 Configuration Files Location
+The manager and the Configurator (`set0.7.c`) primarily use the following paths:
+* **Main Settings:** `%USERPROFILE%\ki_settings.txt`
+* **Favorites:** `%USERPROFILE%\ki_favorites.txt`
+* **File Associations:** `%USERPROFILE%\ki_assoc.txt`
+* **Search Index:** `C:\ki_index.txt` (and `ki_index.bin` for fast loading)
+
+---
+
+### 🛠 Settings Detail (`ki_settings.txt`)
+This file controls the visual behavior and custom icon mappings.
+* **`DarkMode=1`**: Enables the "Neon Dark" mode (Classic Mac aesthetic with a high-contrast green glow).
+* **`TrashSkin=0/1/2`**: Sets the Trash bin design (0: Classic, 1: Mesh, 2: Boxy).
+* **`Icon:.ext=ID`**: Maps a specific file extension to one of the built-in icons (0-5).
+    * *Example:* `Icon:.c=5` maps C files to the "Code" icon.
+
+### 🌟 Favorites (`ki_favorites.txt`)
+Allows you to define quick-access folders in the Star (★) menu.
+* **Format:** `DisplayName -- FullPath`
+* **Example:** `My Projects -- C:\Users\Dev\Projects`
+
+### 🔗 File Associations (`ki_assoc.txt`)
+Define which application should open specific file types within the manager.
+* **Format:** `AppName -- ExecutablePath -- Extensions`
+* **Example:** `VSCode -- C:\Path\To\Code.exe -- .c .h .cpp .json`
+
+### 🔍 Search Index (`ki_index.txt`)
+This file is generated automatically when you run the indexing command (`-ref` in the search bar). It contains a recursive map of your drives for near-instant searching.
+
 <img width="1313" height="745" alt="Screenshot_13" src="https://github.com/user-attachments/assets/a8dd0feb-db98-4781-92e1-42da9b6611e0" />
 Main theme
 
@@ -72,3 +105,8 @@ context menu
 
 <img width="487" height="383" alt="Screenshot_7" src="https://github.com/user-attachments/assets/6b778eb5-fefc-4408-9139-f2a03d32615c" />
 Computer teleport you in disk view space
+
+<img width="700" height="518" alt="Screenshot_18" src="https://github.com/user-attachments/assets/527e5f5c-5b2c-484b-90ec-2769ee7fa24f" />
+Settings
+3 type bin as gift)
+Program will be translated, on eng in future
