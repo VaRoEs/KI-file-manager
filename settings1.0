@@ -1,0 +1,1110 @@
+#include <windows.h>
+#include <windowsx.h>
+#include <stdio.h>
+#include <tchar.h>
+#include <math.h>
+#include <wchar.h>
+
+#ifndef MAX_PATH
+#define MAX_PATH 260
+#endif
+
+// ==============================================================================
+// Глобальные переменные и константы
+// ==============================================================================
+static float dpi_scale = 1.0f;
+static HINSTANCE g_hInst;
+static int S(int px) { return (int)lroundf(px * dpi_scale); }
+
+static int g_currentTab = 0; 
+
+#define MAX_ICONS 6
+#define MAX_MAPPINGS 32
+#define MAX_FAVS 32
+#define MAX_ASSOCS 32
+
+#define VISIBLE_MAPPINGS 4
+#define VISIBLE_FAVS 4
+#define VISIBLE_ASSOCS 4
+
+// --- Структуры данных ---
+typedef struct { wchar_t ext[32]; int iconId; } IconMapping;
+typedef struct { wchar_t name[64]; wchar_t path[MAX_PATH]; } Favorite;
+typedef struct { wchar_t name[64]; wchar_t exePath[MAX_PATH]; wchar_t exts[128]; } Association;
+
+static IconMapping g_mappings[MAX_MAPPINGS];
+static int g_mappingCount = 0; static int g_mappingScroll = 0; static int g_mappingMaxScroll = 0;
+
+static Favorite g_favs[MAX_FAVS];
+static int g_favCount = 0; static int g_favScroll = 0; static int g_favMaxScroll = 0;
+
+static Association g_assocs[MAX_ASSOCS];
+static int g_assocCount = 0; static int g_assocScroll = 0; static int g_assocMaxScroll = 0;
+
+// --- Анимация удаления ---
+typedef struct {
+    BOOL active;
+    int tab;           // 0=mapping, 1=fav, 2=assoc
+    int index;         // индекс удаляемого элемента
+    int rowIndex;      // видимая строка (0-3)
+    float progress;    // 0..1
+    int startTime;     // время начала анимации
+} DeleteAnimation;
+
+static DeleteAnimation g_delAnim = {0};
+static UINT g_animTimer = 0;
+
+// --- Визуальная обратная связь ---
+typedef struct {
+    BOOL active;
+    int tab;
+    int type;          // 0=trash, 1=darkmode, 2=save
+    float progress;
+    int startTime;
+} FlashFeedback;
+
+static FlashFeedback g_flash = {0};
+
+// --- Окна ввода (EDIT) ---
+static HWND g_hIconEdits[VISIBLE_MAPPINGS];
+static HWND g_hFavName[VISIBLE_FAVS], g_hFavPath[VISIBLE_FAVS];
+static HWND g_hAssocName[VISIBLE_ASSOCS], g_hAssocExe[VISIBLE_ASSOCS], g_hAssocExts[VISIBLE_ASSOCS];
+
+static int g_trashSkin = 0; 
+static BOOL g_darkMode = TRUE;
+
+static HWND g_hApplyBtn = NULL;
+static HBRUSH g_hDarkBrush = NULL;
+
+static const wchar_t* kWndClass = L"MacSettingsWnd";
+static wchar_t g_settingsFile[MAX_PATH] = L"";
+static wchar_t g_favFile[MAX_PATH] = L"";
+static wchar_t g_assocFile[MAX_PATH] = L"";
+
+// ==============================================================================
+// Утилиты
+// ==============================================================================
+static void SetDpiAware(void) {
+    HMODULE hUser = GetModuleHandleW(L"user32.dll");
+    if (hUser) {
+        typedef BOOL(WINAPI* SetProc)(HANDLE);
+        SetProc p = (SetProc)GetProcAddress(hUser, "SetProcessDpiAwarenessContext");
+        if (p) { p((HANDLE)-4); return; }
+    }
+    SetProcessDPIAware();
+}
+
+static void PickClassicFont(HFONT* outFont, int heightPx, BOOL bold) {
+    LOGFONTW lf = { 0 }; lf.lfHeight = -S(heightPx); lf.lfWeight = bold ? FW_BOLD : FW_NORMAL;
+    lf.lfQuality = ANTIALIASED_QUALITY;
+    const wchar_t* candidates[] = { L"Chicago", L"Geneva", L"Segoe UI", L"System" };
+    HFONT f = NULL;
+    for (int i = 0; i < 4; ++i) {
+        lstrcpyW(lf.lfFaceName, candidates[i]); f = CreateFontIndirectW(&lf); if (f) break;
+    }
+    if (!f) f = (HFONT)GetStockObject(SYSTEM_FONT);
+    *outFont = f;
+}
+
+static void TrimNewline(wchar_t* str) {
+    size_t len = wcslen(str);
+    while(len > 0 && (str[len-1] == L'\n' || str[len-1] == L'\r')) str[--len] = 0;
+}
+
+static void UpdateMaxScroll(void) {
+    g_mappingMaxScroll = (g_mappingCount > VISIBLE_MAPPINGS) ? g_mappingCount - VISIBLE_MAPPINGS : 0;
+    if (g_mappingScroll > g_mappingMaxScroll) g_mappingScroll = g_mappingMaxScroll;
+    if (g_mappingScroll < 0) g_mappingScroll = 0;
+    
+    g_favMaxScroll = (g_favCount > VISIBLE_FAVS) ? g_favCount - VISIBLE_FAVS : 0;
+    if (g_favScroll > g_favMaxScroll) g_favScroll = g_favMaxScroll;
+    if (g_favScroll < 0) g_favScroll = 0;
+    
+    g_assocMaxScroll = (g_assocCount > VISIBLE_ASSOCS) ? g_assocCount - VISIBLE_ASSOCS : 0;
+    if (g_assocScroll > g_assocMaxScroll) g_assocScroll = g_assocMaxScroll;
+    if (g_assocScroll < 0) g_assocScroll = 0;
+}
+
+static DWORD GetTickCountMs(void) {
+    return GetTickCount();
+}
+
+// ==============================================================================
+// Отрисовка UI Базовая
+// ==============================================================================
+static void DrawClassicBezel(HDC dc, RECT r) {
+    HPEN penBlack = CreatePen(PS_SOLID, S(1), g_darkMode ? RGB(150,150,0) : RGB(0, 0, 0));
+    HPEN penWhite = CreatePen(PS_SOLID, S(1), g_darkMode ? RGB(80,80,0) : RGB(255, 255, 255));
+    HPEN penGray  = CreatePen(PS_SOLID, S(1), g_darkMode ? RGB(40,40,0) : RGB(160, 160, 160));
+    HGDIOBJ old = SelectObject(dc, penBlack); HBRUSH nullBr = (HBRUSH)GetStockObject(NULL_BRUSH); HGDIOBJ oldBr = SelectObject(dc, nullBr);
+    
+    Rectangle(dc, r.left, r.top, r.right, r.bottom); 
+    SelectObject(dc, penWhite);
+    MoveToEx(dc, r.left + S(1), r.bottom - S(2), NULL); LineTo(dc, r.left + S(1), r.top + S(1)); LineTo(dc, r.right - S(2), r.top + S(1));
+    SelectObject(dc, penGray);
+    MoveToEx(dc, r.right - S(2), r.top + S(1), NULL); LineTo(dc, r.right - S(2), r.bottom - S(2)); LineTo(dc, r.left + S(1), r.bottom - S(2));
+    
+    SelectObject(dc, oldBr); SelectObject(dc, old); 
+    DeleteObject(penBlack); DeleteObject(penWhite); DeleteObject(penGray);
+}
+
+static void DrawPinstripe(HDC dc, RECT r) {
+    HBRUSH bg = CreateSolidBrush(g_darkMode ? RGB(20,20,20) : RGB(245,245,245)); FillRect(dc, &r, bg); DeleteObject(bg);
+    HPEN stripe = CreatePen(PS_SOLID, S(1), g_darkMode ? RGB(60,60,0) : RGB(180, 180, 180)); HGDIOBJ old = SelectObject(dc, stripe);
+    for (int y = r.top + S(2); y < r.bottom; y += S(2)) { MoveToEx(dc, r.left, y, NULL); LineTo(dc, r.right, y); }
+    SelectObject(dc, old); DeleteObject(stripe);
+    HPEN border = CreatePen(PS_SOLID, S(1), g_darkMode ? RGB(100,100,0) : RGB(0, 0, 0)); old = SelectObject(dc, border);
+    MoveToEx(dc, r.left, r.bottom - 1, NULL); LineTo(dc, r.right, r.bottom - 1); SelectObject(dc, old); DeleteObject(border);
+}
+
+static void DrawMiniBtn(HDC dc, RECT r, const wchar_t* txt) {
+    DrawClassicBezel(dc, r); HFONT ft; PickClassicFont(&ft, 14, TRUE); HGDIOBJ old = SelectObject(dc, ft);
+    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, g_darkMode ? RGB(180,255,0) : RGB(0,0,0));
+    DrawTextW(dc, txt, -1, &r, DT_CENTER|DT_VCENTER|DT_SINGLELINE); SelectObject(dc, old); DeleteObject(ft);
+}
+
+static void DrawMacButton(LPDRAWITEMSTRUCT di) {
+    HDC dc = di->hDC; RECT r = di->rcItem;
+    HBRUSH bg;
+    if (g_darkMode) {
+        bg = CreateSolidBrush((di->itemState & ODS_SELECTED) ? RGB(180, 255, 0) : RGB(20, 20, 20));
+    } else {
+        bg = CreateSolidBrush((di->itemState & ODS_SELECTED) ? RGB(0, 0, 0) : RGB(255, 255, 255));
+    }
+    FillRect(dc, &r, bg); DeleteObject(bg);
+    DrawClassicBezel(dc, r);
+    
+    wchar_t txt[64]; GetWindowTextW(di->hwndItem, txt, 63);
+    HFONT fBtn; PickClassicFont(&fBtn, 14, TRUE); HGDIOBJ old = SelectObject(dc, fBtn);
+    SetBkMode(dc, TRANSPARENT);
+    
+    COLORREF tCol;
+    if (g_darkMode) {
+        tCol = (di->itemState & ODS_SELECTED) ? RGB(0, 0, 0) : RGB(180, 255, 0);
+    } else {
+        tCol = (di->itemState & ODS_SELECTED) ? RGB(255, 255, 255) : RGB(0, 0, 0);
+    }
+    SetTextColor(dc, tCol); 
+    DrawTextW(dc, txt, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, old); DeleteObject(fBtn);
+}
+
+static void DrawScrollButtons(HDC dc, int x, int y, int maxScroll, int scroll) {
+    RECT upBtn = { x, y, x + S(20), y + S(20) };
+    RECT downBtn = { x, y + S(25), x + S(20), y + S(45) };
+    
+    // Кнопка вверх
+    DrawClassicBezel(dc, upBtn);
+    HPEN pen = CreatePen(PS_SOLID, S(1), g_darkMode ? RGB(180,255,0) : RGB(0,0,0));
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    MoveToEx(dc, upBtn.left + S(10), upBtn.top + S(5), NULL);
+    LineTo(dc, upBtn.left + S(4), upBtn.top + S(12));
+    LineTo(dc, upBtn.left + S(16), upBtn.top + S(12));
+    LineTo(dc, upBtn.left + S(10), upBtn.top + S(5));
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+    
+    // Кнопка вниз
+    DrawClassicBezel(dc, downBtn);
+    pen = CreatePen(PS_SOLID, S(1), g_darkMode ? RGB(180,255,0) : RGB(0,0,0));
+    oldPen = SelectObject(dc, pen);
+    MoveToEx(dc, downBtn.left + S(10), downBtn.bottom - S(5), NULL);
+    LineTo(dc, downBtn.left + S(4), downBtn.bottom - S(12));
+    LineTo(dc, downBtn.left + S(16), downBtn.bottom - S(12));
+    LineTo(dc, downBtn.left + S(10), downBtn.bottom - S(5));
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+}
+
+// Рисует мигающую рамку для обратной связи
+static void DrawFlashFeedback(HDC dc, RECT r, float progress) {
+    if (progress <= 0 || progress >= 1) return;
+    
+    // Синусоидальное затухание
+    float alpha = (float)(sin(progress * 3.14159f) * (1.0f - progress * 0.8f));
+    int thickness = max(1, (int)(S(3) * (1.0f - progress * 0.5f)));
+    
+    HPEN pen = CreatePen(PS_SOLID, thickness, RGB(180, 255, 0));
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    HBRUSH nullBr = (HBRUSH)GetStockObject(NULL_BRUSH);
+    HGDIOBJ oldBr = SelectObject(dc, nullBr);
+    
+    RECT flashR = r;
+    InflateRect(&flashR, S(4), S(4));
+    Rectangle(dc, flashR.left, flashR.top, flashR.right, flashR.bottom);
+    
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBr);
+    DeleteObject(pen);
+}
+
+// ==============================================================================
+// ПОЛНАЯ ОТРИСОВКА ВСЕХ ИКОНОК
+// ==============================================================================
+static void DrawIcon_Folder(HDC dc, RECT r) {
+    int w = r.right - r.left, h = (int)((r.bottom - r.top) * 0.75f);
+    int x = r.left, yOff = r.top + (r.bottom - r.top - h) / 2;
+    int tabW = (int)(w * 0.35f), tabH = (int)(h * 0.2f);
+    HBRUSH bBack = CreateSolidBrush(RGB(240, 200, 100)); HPEN pEdge = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    HGDIOBJ oldB = SelectObject(dc, bBack); HGDIOBJ oldP = SelectObject(dc, pEdge);
+    POINT ptBack[] = { {x, yOff+tabH}, {x, yOff}, {x+tabW, yOff}, {x+tabW+S(4), yOff+tabH}, {x+w, yOff+tabH}, {x+w, yOff+h}, {x, yOff+h} }; Polygon(dc, ptBack, 7);
+    HBRUSH bFront = CreateSolidBrush(RGB(255, 220, 130)); SelectObject(dc, bFront);
+    POINT ptFront[] = { {x, yOff+h}, {x+S(6), yOff+tabH}, {x+w, yOff+tabH}, {x+w-S(6), yOff+h} }; Polygon(dc, ptFront, 4);
+    SelectObject(dc, oldB); SelectObject(dc, oldP); DeleteObject(bBack); DeleteObject(bFront); DeleteObject(pEdge);
+}
+
+static void DrawIcon_File(HDC dc, RECT r) {
+    int w = (int)((r.right - r.left) * 0.75f), h = r.bottom - r.top;
+    int dx = r.left + ((r.right - r.left) - w) / 2, dy = r.top; int fold = (int)(w * 0.3f);
+    HBRUSH bPaper = CreateSolidBrush(RGB(255, 255, 255)); HPEN pEdge = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    HGDIOBJ oldB = SelectObject(dc, bPaper); HGDIOBJ oldP = SelectObject(dc, pEdge);
+    POINT ptDoc[] = { {dx, dy}, {dx+w-fold, dy}, {dx+w, dy+fold}, {dx+w, dy+h}, {dx, dy+h} }; Polygon(dc, ptDoc, 5);
+    MoveToEx(dc, dx+w-fold, dy+fold, NULL); LineTo(dc, dx+w, dy+fold); MoveToEx(dc, dx+w-fold, dy+fold, NULL); LineTo(dc, dx+w-fold, dy);
+    for(int ly = dy + S(12); ly < dy + h - S(8); ly += S(6)) { MoveToEx(dc, dx + S(6), ly, NULL); LineTo(dc, dx + w - S(6), ly); }
+    SelectObject(dc, oldB); SelectObject(dc, oldP); DeleteObject(bPaper); DeleteObject(pEdge);
+}
+
+static void DrawIcon_Microsoft(HDC dc, RECT r) {
+    int sq = ((r.right - r.left) / 2) - S(2);
+    int cx = (r.left + r.right) / 2; int cy = (r.top + r.bottom) / 2;
+    HBRUSH bRed = CreateSolidBrush(RGB(243, 83, 37)); HBRUSH bGreen = CreateSolidBrush(RGB(129, 188, 6));
+    HBRUSH bBlue = CreateSolidBrush(RGB(0, 164, 239)); HBRUSH bYellow = CreateSolidBrush(RGB(255, 186, 8));
+    HPEN pNone = CreatePen(PS_NULL, 0, 0);
+    HGDIOBJ oldP = SelectObject(dc, pNone); HGDIOBJ oldB = SelectObject(dc, bRed);
+    Rectangle(dc, cx - sq - S(1), cy - sq - S(1), cx - S(1), cy - S(1)); 
+    SelectObject(dc, bGreen); Rectangle(dc, cx + S(1), cy - sq - S(1), cx + sq + S(1), cy - S(1)); 
+    SelectObject(dc, bBlue); Rectangle(dc, cx - sq - S(1), cy + S(1), cx - S(1), cy + sq + S(1)); 
+    SelectObject(dc, bYellow); Rectangle(dc, cx + S(1), cy + S(1), cx + sq + S(1), cy + sq + S(1)); 
+    SelectObject(dc, oldB); SelectObject(dc, oldP);
+    DeleteObject(bRed); DeleteObject(bGreen); DeleteObject(bBlue); DeleteObject(bYellow); DeleteObject(pNone);
+}
+
+static void DrawIcon_Terminal(HDC dc, RECT r) {
+    int w = r.right - r.left, h = (int)((r.bottom - r.top) * 0.8f);
+    int y = r.top + (r.bottom - r.top - h) / 2;
+    HBRUSH bBlack = CreateSolidBrush(RGB(20, 20, 20)); HPEN pEdge = CreatePen(PS_SOLID, 1, RGB(100, 100, 100));
+    HGDIOBJ oldB = SelectObject(dc, bBlack); HGDIOBJ oldP = SelectObject(dc, pEdge);
+    RoundRect(dc, r.left, y, r.right, y + h, S(4), S(4));
+    HBRUSH bTop = CreateSolidBrush(RGB(200, 200, 200)); SelectObject(dc, bTop);
+    RECT topR = { r.left, y, r.right, y + S(8) }; FillRect(dc, &topR, bTop);
+    HFONT f = CreateFontW(S(12), 0,0,0, FW_BOLD, FALSE,FALSE,FALSE, DEFAULT_CHARSET, 0,0,0,0, L"Consolas"); 
+    HGDIOBJ oldF = SelectObject(dc, f);
+    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(0, 255, 0)); TextOutW(dc, r.left + S(4), y + S(12), L"C:\\>", 4);
+    SelectObject(dc, oldB); SelectObject(dc, oldP); SelectObject(dc, oldF);
+    DeleteObject(bBlack); DeleteObject(bTop); DeleteObject(pEdge); DeleteObject(f);
+}
+
+static void DrawIcon_Picture(HDC dc, RECT r) {
+    int w = r.right - r.left, h = (int)((r.bottom - r.top) * 0.85f);
+    int y = r.top + (r.bottom - r.top - h) / 2;
+    HBRUSH bWhite = CreateSolidBrush(RGB(255, 255, 255)); HPEN pEdge = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    HGDIOBJ oldB = SelectObject(dc, bWhite); HGDIOBJ oldP = SelectObject(dc, pEdge);
+    Rectangle(dc, r.left, y, r.right, y + h);
+    HRGN clip = CreateRectRgn(r.left+1, y+1, r.right-1, y+h-1); SelectClipRgn(dc, clip);
+    HBRUSH bSun = CreateSolidBrush(RGB(255, 200, 0)); SelectObject(dc, bSun);
+    Ellipse(dc, r.left + S(6), y + S(6), r.left + S(22), y + S(22));
+    HBRUSH bMount1 = CreateSolidBrush(RGB(100, 150, 200)); SelectObject(dc, bMount1);
+    POINT pm1[] = { {r.left - S(10), y+h}, {r.left + w/2, y + S(15)}, {r.right, y+h} }; Polygon(dc, pm1, 3);
+    HBRUSH bMount2 = CreateSolidBrush(RGB(80, 120, 160)); SelectObject(dc, bMount2);
+    POINT pm2[] = { {r.left + w/3, y+h}, {r.right - S(10), y + S(25)}, {r.right + S(10), y+h} }; Polygon(dc, pm2, 3);
+    SelectClipRgn(dc, NULL); DeleteObject(clip); SelectObject(dc, oldB); SelectObject(dc, oldP);
+    DeleteObject(bWhite); DeleteObject(pEdge); DeleteObject(bSun); DeleteObject(bMount1); DeleteObject(bMount2);
+}
+
+static void DrawIcon_Code(HDC dc, RECT r) {
+    DrawIcon_File(dc, r);
+    HFONT f = CreateFontW(S(20), 0,0,0, FW_BOLD, FALSE,FALSE,FALSE, DEFAULT_CHARSET, 0,0,0,0, L"Consolas");
+    HGDIOBJ oldF = SelectObject(dc, f); SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(40, 80, 180));
+    RECT tr = r; tr.top += S(8); DrawTextW(dc, L"{ }", -1, &tr, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    SelectObject(dc, oldF); DeleteObject(f);
+}
+
+static void DrawIconByType(HDC dc, RECT r, int type) {
+    switch (type) {
+        case 0: DrawIcon_Folder(dc, r); break;
+        case 1: DrawIcon_File(dc, r); break;
+        case 2: DrawIcon_Microsoft(dc, r); break;
+        case 3: DrawIcon_Terminal(dc, r); break;
+        case 4: DrawIcon_Picture(dc, r); break;
+        case 5: DrawIcon_Code(dc, r); break;
+        default: DrawIcon_File(dc, r); break;
+    }
+}
+
+// ==============================================================================
+// ПОЛНАЯ ОТРИСОВКА КОРЗИН
+// ==============================================================================
+static void DrawTrash_Classic(HDC dc, RECT r) {
+    int w = (int)((r.right - r.left) * 0.7f), h = (int)((r.bottom - r.top) * 0.85f);
+    int dx = r.left + ((r.right - r.left) - w)/2, dy = r.top + ((r.bottom - r.top) - h)/2;
+    int s1 = S(1), s2 = S(2), s4 = S(4), s6 = S(6), s8 = S(8), s10 = S(10);
+    HPEN pNone = CreatePen(PS_NULL, 0, 0); HGDIOBJ oldP = SelectObject(dc, pNone);
+    HBRUSH bBody = CreateSolidBrush(RGB(210, 215, 220)); HPEN pEdge = CreatePen(PS_SOLID, s1, RGB(80, 80, 80));
+    SelectObject(dc, bBody); SelectObject(dc, pEdge);
+    Rectangle(dc, dx, dy+s10, dx+w, dy+h); Ellipse(dc, dx, dy+h-s8, dx+w, dy+h+s8);
+    HPEN pRidge = CreatePen(PS_SOLID, s1, RGB(160, 160, 170)); HPEN pHi = CreatePen(PS_SOLID, s1, RGB(240, 245, 250));
+    for (int rx = dx + s6; rx < dx + w - s4; rx += s6) {
+        SelectObject(dc, pRidge); MoveToEx(dc, rx, dy+s10, NULL); LineTo(dc, rx, dy+h+s2);
+        SelectObject(dc, pHi); MoveToEx(dc, rx+s1, dy+s10, NULL); LineTo(dc, rx+s1, dy+h+s2);
+    }
+    SelectObject(dc, bBody); SelectObject(dc, pEdge); Ellipse(dc, dx, dy+s4, dx+w, dy+s10+s6);
+    HBRUSH bLid = CreateSolidBrush(RGB(230, 235, 240)); SelectObject(dc, bLid);
+    Ellipse(dc, dx-s2, dy-s2, dx+w+s2, dy+s8);
+    MoveToEx(dc, dx+w/2-s6, dy-s2, NULL); LineTo(dc, dx+w/2-s6, dy-s6);
+    LineTo(dc, dx+w/2+s6, dy-s6); LineTo(dc, dx+w/2+s6, dy-s2);
+    SelectObject(dc, oldP); DeleteObject(pNone); DeleteObject(bBody); DeleteObject(pEdge); DeleteObject(pRidge); DeleteObject(pHi); DeleteObject(bLid);
+}
+
+static void DrawTrash_Mesh(HDC dc, RECT r) {
+    int w = (int)((r.right - r.left) * 0.75f), h = (int)((r.bottom - r.top) * 0.8f);
+    int dx = r.left + ((r.right - r.left) - w)/2, dy = r.top + ((r.bottom - r.top) - h)/2;
+    HPEN pEdge = CreatePen(PS_SOLID, S(2), RGB(100, 120, 140)); HGDIOBJ oldP = SelectObject(dc, pEdge); 
+    HBRUSH nullBr = (HBRUSH)GetStockObject(NULL_BRUSH); HGDIOBJ oldB = SelectObject(dc, nullBr);
+    POINT pts[] = { {dx, dy}, {dx+w, dy}, {dx+w-S(10), dy+h}, {dx+S(10), dy+h} }; Polygon(dc, pts, 4);
+    HPEN pMesh = CreatePen(PS_SOLID, 1, RGB(150, 170, 190)); SelectObject(dc, pMesh);
+    for (int y = dy + S(8); y < dy + h; y += S(8)) { MoveToEx(dc, dx + S(2), y, NULL); LineTo(dc, dx+w - S(2), y); }
+    for (int x = dx + S(8); x < dx + w; x += S(8)) { MoveToEx(dc, x, dy, NULL); LineTo(dc, x - S(6), dy+h); }
+    SelectObject(dc, oldP); SelectObject(dc, oldB); DeleteObject(pEdge); DeleteObject(pMesh);
+}
+
+static void DrawTrash_Boxy(HDC dc, RECT r) {
+    int w = (int)((r.right - r.left) * 0.65f), h = (int)((r.bottom - r.top) * 0.85f);
+    int dx = r.left + ((r.right - r.left) - w)/2, dy = r.top + ((r.bottom - r.top) - h)/2;
+    HBRUSH bDark = CreateSolidBrush(RGB(50, 50, 50)); HPEN pEdge = CreatePen(PS_SOLID, S(2), RGB(0, 0, 0));
+    HGDIOBJ oldB = SelectObject(dc, bDark); HGDIOBJ oldP = SelectObject(dc, pEdge);
+    Rectangle(dc, dx, dy + S(15), dx+w, dy+h);
+    HBRUSH bGreen = CreateSolidBrush(RGB(40, 200, 80)); SelectObject(dc, bGreen);
+    Rectangle(dc, dx - S(5), dy, dx+w + S(5), dy + S(10));
+    HPEN pLine = CreatePen(PS_SOLID, S(3), RGB(80, 220, 100)); SelectObject(dc, pLine);
+    MoveToEx(dc, dx + w/2, dy + S(25), NULL); LineTo(dc, dx + w/2, dy+h - S(10));
+    SelectObject(dc, oldB); SelectObject(dc, oldP); DeleteObject(bDark); DeleteObject(pEdge); DeleteObject(bGreen); DeleteObject(pLine);
+}
+
+// ==============================================================================
+// Проприетарные Всплывающие Окна
+// ==============================================================================
+static LRESULT CALLBACK MsgBoxProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch(m) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); RECT cr; GetClientRect(h, &cr);
+            HBRUSH bg = CreateSolidBrush(g_darkMode ? RGB(20,20,20) : RGB(245,245,245)); FillRect(dc, &cr, bg); DeleteObject(bg);
+            RECT tr = cr; tr.bottom = S(24); DrawPinstripe(dc, tr);
+            HFONT ft; PickClassicFont(&ft, 14, TRUE); SelectObject(dc, ft);
+            SetBkMode(dc, TRANSPARENT); SetTextColor(dc, g_darkMode ? RGB(180,255,0) : RGB(0,0,0)); 
+            const wchar_t* title = (const wchar_t*)GetPropW(h, L"MB_TITLE"); 
+            TextOutW(dc, cr.right/2 - S(30), S(4), title ? title : L"Info", lstrlenW(title ? title : L"Info"));
+            
+            RECT cb = { S(6), S(5), S(20), S(19) }; DrawClassicBezel(dc, cb);
+            HPEN pCross = CreatePen(PS_SOLID, 1, g_darkMode ? RGB(180,255,0) : RGB(0,0,0)); HGDIOBJ oldP = SelectObject(dc, pCross);
+            MoveToEx(dc, cb.left+S(3), cb.top+S(3), NULL); LineTo(dc, cb.right-S(3), cb.bottom-S(3));
+            MoveToEx(dc, cb.right-S(3), cb.top+S(3), NULL); LineTo(dc, cb.left+S(3), cb.bottom-S(3));
+            SelectObject(dc, oldP); DeleteObject(pCross);
+
+            const wchar_t* msg = (const wchar_t*)GetPropW(h, L"MB_MSG");
+            RECT mr = { S(15), S(40), cr.right-S(15), cr.bottom-S(40) }; DrawTextW(dc, msg, -1, &mr, DT_CENTER|DT_WORDBREAK);
+            DrawClassicBezel(dc, cr); EndPaint(h, &ps);
+        } return 0;
+        case WM_DRAWITEM: { DrawMacButton((LPDRAWITEMSTRUCT)l); return TRUE; }
+        case WM_LBUTTONDOWN: {
+            int mx = GET_X_LPARAM(l), my = GET_Y_LPARAM(l); RECT cb = { S(6), S(5), S(20), S(19) };
+            if (PtInRect(&cb, (POINT){mx, my})) { DestroyWindow(h); return 0; }
+            if (my < S(24)) { ReleaseCapture(); SendMessage(h, WM_NCLBUTTONDOWN, HTCAPTION, 0); }
+        } return 0;
+        case WM_COMMAND: if (LOWORD(w)==1) DestroyWindow(h); return 0;
+    } return DefWindowProc(h, m, w, l);
+}
+
+static void ShowMacMessageBox(HWND parent, const wchar_t* msg, const wchar_t* title) {
+    WNDCLASSW wc = {0};
+    if (!GetClassInfoW(g_hInst, L"MacMsgBoxClass", &wc)) {
+        wc.lpfnWndProc = MsgBoxProc; wc.hInstance = g_hInst; wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.lpszClassName = L"MacMsgBoxClass"; RegisterClassW(&wc);
+    }
+    int w = S(340), h = S(160); RECT pr; GetWindowRect(parent, &pr);
+    int x = pr.left + (pr.right - pr.left - w)/2; int y = pr.top + (pr.bottom - pr.top - h)/2;
+    HWND mb = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW, L"MacMsgBoxClass", L"", WS_POPUP|WS_CLIPCHILDREN, x, y, w, h, parent, NULL, g_hInst, NULL);
+    SetPropW(mb, L"MB_MSG", (HANDLE)msg); SetPropW(mb, L"MB_TITLE", (HANDLE)title);
+    CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD|WS_VISIBLE|BS_OWNERDRAW, (w-S(80))/2, h-S(36), S(80), S(26), mb, (HMENU)1, g_hInst, NULL);
+    EnableWindow(parent, FALSE); ShowWindow(mb, SW_SHOW); MSG m;
+    while(IsWindow(mb) && GetMessage(&m, NULL, 0, 0)) { TranslateMessage(&m); DispatchMessage(&m); }
+    EnableWindow(parent, TRUE); SetForegroundWindow(parent);
+}
+
+// ==============================================================================
+// Управление файлами конфигурации
+// ==============================================================================
+static void EnsureConfigFiles() {
+    if (g_settingsFile[0]) return;
+    wchar_t prof[MAX_PATH]; GetEnvironmentVariableW(L"USERPROFILE", prof, MAX_PATH);
+    lstrcpyW(g_settingsFile, prof); lstrcatW(g_settingsFile, L"\\ki_settings.txt");
+    lstrcpyW(g_favFile, prof); lstrcatW(g_favFile, L"\\ki_favorites.txt");
+    lstrcpyW(g_assocFile, prof); lstrcatW(g_assocFile, L"\\ki_assoc.txt");
+}
+
+static void LoadSettings() {
+    EnsureConfigFiles();
+    FILE* f = _wfopen(g_settingsFile, L"rt,ccs=UTF-8");
+    g_mappingCount = 0;
+    if (f) {
+        wchar_t line[512];
+        while(fgetws(line, 512, f)) {
+            if (wcsncmp(line, L"TrashSkin=", 10) == 0) g_trashSkin = _wtoi(line+10);
+            else if (wcsncmp(line, L"DarkMode=", 9) == 0) g_darkMode = _wtoi(line+9);
+            else if (wcsncmp(line, L"Icon:", 5) == 0) {
+                wchar_t* eq = wcschr(line, L'=');
+                if (eq && g_mappingCount < MAX_MAPPINGS) {
+                    *eq = 0; lstrcpynW(g_mappings[g_mappingCount].ext, line+5, 31);
+                    g_mappings[g_mappingCount].iconId = _wtoi(eq+1); g_mappingCount++;
+                }
+            }
+        }
+        fclose(f);
+    } else {
+        lstrcpyW(g_mappings[0].ext, L".txt"); g_mappings[0].iconId = 1; g_mappingCount = 1; 
+    }
+
+    f = _wfopen(g_favFile, L"rt,ccs=UTF-8");
+    g_favCount = 0;
+    if (f) {
+        wchar_t line[512];
+        while(fgetws(line, 512, f)) {
+            TrimNewline(line);
+            wchar_t* sep = wcsstr(line, L" -- ");
+            if (sep && g_favCount < MAX_FAVS) {
+                *sep = 0; 
+                lstrcpynW(g_favs[g_favCount].name, line, 63);
+                lstrcpynW(g_favs[g_favCount].path, sep + 4, MAX_PATH-1);
+                g_favCount++;
+            }
+        }
+        fclose(f);
+    } else {
+        lstrcpyW(g_favs[0].name, L"Диск C"); lstrcpyW(g_favs[0].path, L"C:\\"); g_favCount = 1;
+    }
+
+    f = _wfopen(g_assocFile, L"rt,ccs=UTF-8");
+    g_assocCount = 0;
+    if (f) {
+        wchar_t line[1024];
+        while(fgetws(line, 1024, f)) {
+            TrimNewline(line);
+            wchar_t* sep1 = wcsstr(line, L" -- ");
+            if (sep1 && g_assocCount < MAX_ASSOCS) {
+                *sep1 = 0;
+                wchar_t* sep2 = wcsstr(sep1 + 4, L" -- ");
+                if (sep2) {
+                    *sep2 = 0;
+                    lstrcpynW(g_assocs[g_assocCount].name, line, 63);
+                    lstrcpynW(g_assocs[g_assocCount].exePath, sep1 + 4, MAX_PATH-1);
+                    lstrcpynW(g_assocs[g_assocCount].exts, sep2 + 4, 127);
+                    g_assocCount++;
+                }
+            }
+        }
+        fclose(f);
+    } else {
+        lstrcpyW(g_assocs[0].name, L"Блокнот"); lstrcpyW(g_assocs[0].exePath, L"notepad.exe"); lstrcpyW(g_assocs[0].exts, L".txt .ini"); g_assocCount = 1;
+    }
+    UpdateMaxScroll();
+}
+
+static void SyncEdits(BOOL toUI) {
+    for (int i = 0; i < VISIBLE_MAPPINGS; i++) {
+        int idx = g_mappingScroll + i;
+        if (toUI) {
+            if (idx < g_mappingCount) {
+                SetWindowTextW(g_hIconEdits[i], g_mappings[idx].ext);
+                ShowWindow(g_hIconEdits[i], (g_currentTab == 0) ? SW_SHOWNOACTIVATE : SW_HIDE);
+            } else ShowWindow(g_hIconEdits[i], SW_HIDE);
+        } else {
+            if (idx < g_mappingCount && g_currentTab == 0 && IsWindowVisible(g_hIconEdits[i]))
+                GetWindowTextW(g_hIconEdits[i], g_mappings[idx].ext, 31);
+        }
+    }
+    for (int i = 0; i < VISIBLE_FAVS; i++) {
+        int idx = g_favScroll + i;
+        if (toUI) {
+            if (idx < g_favCount) {
+                SetWindowTextW(g_hFavName[i], g_favs[idx].name);
+                SetWindowTextW(g_hFavPath[i], g_favs[idx].path);
+                ShowWindow(g_hFavName[i], (g_currentTab == 1) ? SW_SHOWNOACTIVATE : SW_HIDE);
+                ShowWindow(g_hFavPath[i], (g_currentTab == 1) ? SW_SHOWNOACTIVATE : SW_HIDE);
+            } else { ShowWindow(g_hFavName[i], SW_HIDE); ShowWindow(g_hFavPath[i], SW_HIDE); }
+        } else {
+            if (idx < g_favCount && g_currentTab == 1 && IsWindowVisible(g_hFavName[i])) {
+                GetWindowTextW(g_hFavName[i], g_favs[idx].name, 63);
+                GetWindowTextW(g_hFavPath[i], g_favs[idx].path, MAX_PATH-1);
+            }
+        }
+    }
+    for (int i = 0; i < VISIBLE_ASSOCS; i++) {
+        int idx = g_assocScroll + i;
+        if (toUI) {
+            if (idx < g_assocCount) {
+                SetWindowTextW(g_hAssocName[i], g_assocs[idx].name);
+                SetWindowTextW(g_hAssocExe[i], g_assocs[idx].exePath);
+                SetWindowTextW(g_hAssocExts[i], g_assocs[idx].exts);
+                int cmd = (g_currentTab == 2) ? SW_SHOWNOACTIVATE : SW_HIDE;
+                ShowWindow(g_hAssocName[i], cmd); ShowWindow(g_hAssocExe[i], cmd); ShowWindow(g_hAssocExts[i], cmd);
+            } else { ShowWindow(g_hAssocName[i], SW_HIDE); ShowWindow(g_hAssocExe[i], SW_HIDE); ShowWindow(g_hAssocExts[i], SW_HIDE); }
+        } else {
+            if (idx < g_assocCount && g_currentTab == 2 && IsWindowVisible(g_hAssocName[i])) {
+                GetWindowTextW(g_hAssocName[i], g_assocs[idx].name, 63);
+                GetWindowTextW(g_hAssocExe[i], g_assocs[idx].exePath, MAX_PATH-1);
+                GetWindowTextW(g_hAssocExts[i], g_assocs[idx].exts, 127);
+            }
+        }
+    }
+}
+
+static void StartDeleteAnimation(int tab, int index, int rowIndex) {
+    g_delAnim.active = TRUE;
+    g_delAnim.tab = tab;
+    g_delAnim.index = index;
+    g_delAnim.rowIndex = rowIndex;
+    g_delAnim.progress = 0.0f;
+    g_delAnim.startTime = GetTickCountMs();
+    
+    if (!g_animTimer) {
+        g_animTimer = SetTimer(GetForegroundWindow(), 9999, 16, NULL);
+    }
+}
+
+static void UpdateAnimations(HWND h) {
+    DWORD now = GetTickCountMs();
+    BOOL needRedraw = FALSE;
+    
+    // Анимация удаления
+    if (g_delAnim.active) {
+        DWORD elapsed = now - g_delAnim.startTime;
+        g_delAnim.progress = elapsed / 150.0f; // 150ms анимация
+        if (g_delAnim.progress >= 1.0f) {
+            // Анимация завершена - реально удаляем элемент
+            switch (g_delAnim.tab) {
+                case 0:
+                    if (g_delAnim.index < g_mappingCount) {
+                        for (int j = g_delAnim.index; j < g_mappingCount - 1; j++)
+                            g_mappings[j] = g_mappings[j+1];
+                        g_mappingCount--;
+                    }
+                    break;
+                case 1:
+                    if (g_delAnim.index < g_favCount) {
+                        for (int j = g_delAnim.index; j < g_favCount - 1; j++)
+                            g_favs[j] = g_favs[j+1];
+                        g_favCount--;
+                    }
+                    break;
+                case 2:
+                    if (g_delAnim.index < g_assocCount) {
+                        for (int j = g_delAnim.index; j < g_assocCount - 1; j++)
+                            g_assocs[j] = g_assocs[j+1];
+                        g_assocCount--;
+                    }
+                    break;
+            }
+            UpdateMaxScroll();
+            SyncEdits(TRUE);
+            g_delAnim.active = FALSE;
+            if (g_animTimer) {
+                KillTimer(h, 9999);
+                g_animTimer = 0;
+            }
+        }
+        needRedraw = TRUE;
+    }
+    
+    // Анимация вспышки
+    if (g_flash.active) {
+        DWORD elapsed = now - g_flash.startTime;
+        g_flash.progress = elapsed / 400.0f; // 400ms анимация
+        if (g_flash.progress >= 1.0f) {
+            g_flash.active = FALSE;
+        }
+        needRedraw = TRUE;
+    }
+    
+    if (needRedraw) {
+        InvalidateRect(h, NULL, TRUE);
+    }
+}
+
+static void SaveSettings(HWND h) {
+    SyncEdits(FALSE); EnsureConfigFiles();
+    
+    // Показываем вспышку на кнопке Save
+    g_flash.active = TRUE;
+    g_flash.type = 2;
+    g_flash.progress = 0.0f;
+    g_flash.startTime = GetTickCountMs();
+    
+    FILE* f = _wfopen(g_settingsFile, L"w,ccs=UTF-8");
+    if (f) {
+        fwprintf(f, L"TrashSkin=%d\nDarkMode=%d\n", g_trashSkin, g_darkMode ? 1 : 0);
+        for(int i=0; i<g_mappingCount; i++) if(g_mappings[i].ext[0]) fwprintf(f, L"Icon:%s=%d\n", g_mappings[i].ext, g_mappings[i].iconId);
+        fclose(f);
+    }
+    f = _wfopen(g_favFile, L"w,ccs=UTF-8");
+    if (f) {
+        for(int i=0; i<g_favCount; i++) if(g_favs[i].name[0] && g_favs[i].path[0])
+            fwprintf(f, L"%s -- %s\n", g_favs[i].name, g_favs[i].path);
+        fclose(f);
+    }
+    f = _wfopen(g_assocFile, L"w,ccs=UTF-8");
+    if (f) {
+        for(int i=0; i<g_assocCount; i++) if(g_assocs[i].name[0])
+            fwprintf(f, L"%s -- %s -- %s\n", g_assocs[i].name, g_assocs[i].exePath, g_assocs[i].exts);
+        fclose(f);
+    }
+    
+    InvalidateRect(h, NULL, TRUE);
+    ShowMacMessageBox(h, L"Все файлы конфигурации успешно записаны!\n(settings, favorites, assoc)\nФайловый менеджер обновится.", L"Успешно сохранено");
+}
+
+// ==============================================================================
+// Оконная процедура Основного Окна
+// ==============================================================================
+static LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+        case WM_CREATE: {
+            LoadSettings();
+            HFONT fEdit; PickClassicFont(&fEdit, 16, TRUE); 
+            HFONT fBtn; PickClassicFont(&fBtn, 14, TRUE);
+            
+            int startX = S(160); int startY = S(80); int rowH = S(40);
+            
+            for(int i=0; i<VISIBLE_MAPPINGS; i++) {
+                g_hIconEdits[i] = CreateWindowExW(0, L"EDIT", L"", WS_CHILD|WS_BORDER|ES_AUTOHSCROLL, startX, startY + i*rowH + S(10), S(80), S(24), h, NULL, g_hInst, NULL);
+                SendMessageW(g_hIconEdits[i], WM_SETFONT, (WPARAM)fEdit, TRUE);
+            }
+            for(int i=0; i<VISIBLE_FAVS; i++) {
+                g_hFavName[i] = CreateWindowExW(0, L"EDIT", L"", WS_CHILD|WS_BORDER|ES_AUTOHSCROLL, startX, startY + i*rowH + S(10), S(120), S(24), h, NULL, g_hInst, NULL);
+                g_hFavPath[i] = CreateWindowExW(0, L"EDIT", L"", WS_CHILD|WS_BORDER|ES_AUTOHSCROLL, startX + S(130), startY + i*rowH + S(10), S(250), S(24), h, NULL, g_hInst, NULL);
+                SendMessageW(g_hFavName[i], WM_SETFONT, (WPARAM)fEdit, TRUE); SendMessageW(g_hFavPath[i], WM_SETFONT, (WPARAM)fEdit, TRUE);
+            }
+            for(int i=0; i<VISIBLE_ASSOCS; i++) {
+                g_hAssocName[i] = CreateWindowExW(0, L"EDIT", L"", WS_CHILD|WS_BORDER|ES_AUTOHSCROLL, startX, startY + i*rowH + S(10), S(100), S(24), h, NULL, g_hInst, NULL);
+                g_hAssocExe[i]  = CreateWindowExW(0, L"EDIT", L"", WS_CHILD|WS_BORDER|ES_AUTOHSCROLL, startX + S(110), startY + i*rowH + S(10), S(220), S(24), h, NULL, g_hInst, NULL);
+                g_hAssocExts[i] = CreateWindowExW(0, L"EDIT", L"", WS_CHILD|WS_BORDER|ES_AUTOHSCROLL, startX + S(340), startY + i*rowH + S(10), S(140), S(24), h, NULL, g_hInst, NULL);
+                SendMessageW(g_hAssocName[i], WM_SETFONT, (WPARAM)fEdit, TRUE); SendMessageW(g_hAssocExe[i], WM_SETFONT, (WPARAM)fEdit, TRUE); SendMessageW(g_hAssocExts[i], WM_SETFONT, (WPARAM)fEdit, TRUE);
+            }
+            
+            SyncEdits(TRUE);
+            g_hApplyBtn = CreateWindowExW(0, L"BUTTON", L"Записать все файлы", WS_CHILD|WS_VISIBLE|BS_OWNERDRAW, S(300), S(420), S(200), S(34), h, (HMENU)102, g_hInst, NULL);
+            SendMessageW(g_hApplyBtn, WM_SETFONT, (WPARAM)fBtn, TRUE);
+            g_hDarkBrush = CreateSolidBrush(RGB(15, 15, 15));
+            
+            SetTimer(h, 1000, 16, NULL); // Таймер для анимаций
+        } return 0;
+        
+        case WM_TIMER:
+            if (w == 1000) {
+                UpdateAnimations(h);
+            }
+            return 0;
+        
+        case WM_CTLCOLOREDIT: {
+            HDC dc = (HDC)w;
+            if (g_darkMode) { 
+                SetTextColor(dc, RGB(180, 255, 0));
+                SetBkColor(dc, RGB(15, 15, 15)); 
+                return (LRESULT)g_hDarkBrush; 
+            } else { 
+                SetTextColor(dc, RGB(0, 0, 0)); 
+                SetBkColor(dc, RGB(255, 255, 255)); 
+                return (LRESULT)GetStockObject(WHITE_BRUSH); 
+            }
+        }
+        
+        case WM_DRAWITEM: { DrawMacButton((LPDRAWITEMSTRUCT)l); return TRUE; }
+        case WM_COMMAND: { if (LOWORD(w) == 102) SaveSettings(h); } return 0;
+        
+        case WM_MOUSEWHEEL: {
+            int delta = GET_WHEEL_DELTA_WPARAM(w);
+            int scrollDelta = (delta > 0) ? -1 : 1;
+            
+            if (g_currentTab == 0) {
+                int newScroll = g_mappingScroll + scrollDelta;
+                if (newScroll >= 0 && newScroll <= g_mappingMaxScroll) {
+                    g_mappingScroll = newScroll;
+                    SyncEdits(TRUE);
+                    InvalidateRect(h, NULL, TRUE);
+                }
+            } else if (g_currentTab == 1) {
+                int newScroll = g_favScroll + scrollDelta;
+                if (newScroll >= 0 && newScroll <= g_favMaxScroll) {
+                    g_favScroll = newScroll;
+                    SyncEdits(TRUE);
+                    InvalidateRect(h, NULL, TRUE);
+                }
+            } else if (g_currentTab == 2) {
+                int newScroll = g_assocScroll + scrollDelta;
+                if (newScroll >= 0 && newScroll <= g_assocMaxScroll) {
+                    g_assocScroll = newScroll;
+                    SyncEdits(TRUE);
+                    InvalidateRect(h, NULL, TRUE);
+                }
+            }
+            return 0;
+        }
+        
+        case WM_LBUTTONDOWN: {
+            int mx = GET_X_LPARAM(l), my = GET_Y_LPARAM(l);
+            
+            if (my < S(30)) {
+                RECT cb = { S(8), S(6), S(22), S(20) };
+                if (PtInRect(&cb, (POINT){mx, my})) { PostQuitMessage(0); return 0; }
+                ReleaseCapture(); SendMessage(h, WM_NCLBUTTONDOWN, HTCAPTION, 0); return 0;
+            }
+            
+            // Переключение вкладок
+            if (mx >= 0 && mx <= S(140) && my >= S(30)) {
+                SyncEdits(FALSE);
+                int t = (my - S(40)) / S(40);
+                if (t >= 0 && t <= 4) g_currentTab = t;
+                SyncEdits(TRUE); 
+                UpdateMaxScroll();
+                InvalidateRect(h, NULL, TRUE);
+                return 0;
+            }
+            
+            int startX = S(160); int startY = S(80); int rowH = S(40);
+            
+            // Обработка скролл-кнопок
+            int scrollX = startX + S(250);
+            if (g_currentTab == 0) {
+                RECT upBtn = { scrollX, startY - S(10), scrollX + S(20), startY + S(10) };
+                RECT downBtn = { scrollX, startY + VISIBLE_MAPPINGS * rowH - S(20), scrollX + S(20), startY + VISIBLE_MAPPINGS * rowH };
+                if (PtInRect(&upBtn, (POINT){mx, my}) && g_mappingScroll > 0) {
+                    g_mappingScroll--;
+                    SyncEdits(TRUE);
+                    InvalidateRect(h, NULL, TRUE);
+                    return 0;
+                }
+                if (PtInRect(&downBtn, (POINT){mx, my}) && g_mappingScroll < g_mappingMaxScroll) {
+                    g_mappingScroll++;
+                    SyncEdits(TRUE);
+                    InvalidateRect(h, NULL, TRUE);
+                    return 0;
+                }
+            } else if (g_currentTab == 1) {
+                scrollX = startX + S(450);
+                RECT upBtn = { scrollX, startY - S(10), scrollX + S(20), startY + S(10) };
+                RECT downBtn = { scrollX, startY + VISIBLE_FAVS * rowH - S(20), scrollX + S(20), startY + VISIBLE_FAVS * rowH };
+                if (PtInRect(&upBtn, (POINT){mx, my}) && g_favScroll > 0) {
+                    g_favScroll--;
+                    SyncEdits(TRUE);
+                    InvalidateRect(h, NULL, TRUE);
+                    return 0;
+                }
+                if (PtInRect(&downBtn, (POINT){mx, my}) && g_favScroll < g_favMaxScroll) {
+                    g_favScroll++;
+                    SyncEdits(TRUE);
+                    InvalidateRect(h, NULL, TRUE);
+                    return 0;
+                }
+            } else if (g_currentTab == 2) {
+                scrollX = startX + S(550);
+                RECT upBtn = { scrollX, startY - S(10), scrollX + S(20), startY + S(10) };
+                RECT downBtn = { scrollX, startY + VISIBLE_ASSOCS * rowH - S(20), scrollX + S(20), startY + VISIBLE_ASSOCS * rowH };
+                if (PtInRect(&upBtn, (POINT){mx, my}) && g_assocScroll > 0) {
+                    g_assocScroll--;
+                    SyncEdits(TRUE);
+                    InvalidateRect(h, NULL, TRUE);
+                    return 0;
+                }
+                if (PtInRect(&downBtn, (POINT){mx, my}) && g_assocScroll < g_assocMaxScroll) {
+                    g_assocScroll++;
+                    SyncEdits(TRUE);
+                    InvalidateRect(h, NULL, TRUE);
+                    return 0;
+                }
+            }
+            
+            // Обработка кнопок для вкладки Иконки
+            if (g_currentTab == 0) {
+                for (int i=0; i<VISIBLE_MAPPINGS; i++) {
+                    int idx = g_mappingScroll + i; if (idx >= g_mappingCount) break;
+                    int y = startY + i*rowH;
+                    RECT rPrev = { startX + S(90), y + S(10), startX + S(115), y + S(34) };
+                    RECT rNext = { startX + S(165), y + S(10), startX + S(190), y + S(34) };
+                    RECT rDel  = { startX + S(200), y + S(10), startX + S(230), y + S(34) };
+                    if (PtInRect(&rPrev, (POINT){mx, my})) { 
+                        SyncEdits(FALSE); 
+                        g_mappings[idx].iconId = (g_mappings[idx].iconId - 1 + MAX_ICONS) % MAX_ICONS; 
+                        InvalidateRect(h, NULL, TRUE); 
+                        break; 
+                    } else if (PtInRect(&rNext, (POINT){mx, my})) { 
+                        SyncEdits(FALSE); 
+                        g_mappings[idx].iconId = (g_mappings[idx].iconId + 1) % MAX_ICONS; 
+                        InvalidateRect(h, NULL, TRUE); 
+                        break; 
+                    } else if (PtInRect(&rDel, (POINT){mx, my})) { 
+                        StartDeleteAnimation(0, idx, i);
+                        return 0;
+                    }
+                }
+                if (PtInRect(&(RECT){startX, startY + VISIBLE_MAPPINGS*rowH + S(10), startX+S(100), startY + VISIBLE_MAPPINGS*rowH + S(34)}, (POINT){mx, my})) {
+                    if (g_mappingCount < MAX_MAPPINGS) { 
+                        SyncEdits(FALSE); 
+                        lstrcpyW(g_mappings[g_mappingCount].ext, L".new"); 
+                        g_mappings[g_mappingCount].iconId = 0; 
+                        g_mappingCount++; 
+                        UpdateMaxScroll();
+                        SyncEdits(TRUE); 
+                        InvalidateRect(h, NULL, TRUE); 
+                    }
+                }
+            }
+            
+            // Обработка для вкладки Избранное
+            if (g_currentTab == 1) {
+                for (int i=0; i<VISIBLE_FAVS; i++) {
+                    int idx = g_favScroll + i; if (idx >= g_favCount) break;
+                    if (PtInRect(&(RECT){ startX + S(390), startY + i*rowH + S(10), startX + S(420), startY + i*rowH + S(34) }, (POINT){mx, my})) {
+                        StartDeleteAnimation(1, idx, i);
+                        return 0;
+                    }
+                }
+                if (PtInRect(&(RECT){startX, startY + VISIBLE_FAVS*rowH + S(10), startX+S(100), startY + VISIBLE_FAVS*rowH + S(34)}, (POINT){mx, my})) {
+                    if (g_favCount < MAX_FAVS) { 
+                        SyncEdits(FALSE); 
+                        lstrcpyW(g_favs[g_favCount].name, L"Папка"); 
+                        lstrcpyW(g_favs[g_favCount].path, L"C:\\"); 
+                        g_favCount++; 
+                        UpdateMaxScroll();
+                        SyncEdits(TRUE); 
+                        InvalidateRect(h, NULL, TRUE); 
+                    }
+                }
+            }
+            
+            // Обработка для вкладки Ассоциации
+            if (g_currentTab == 2) {
+                for (int i=0; i<VISIBLE_ASSOCS; i++) {
+                    int idx = g_assocScroll + i; if (idx >= g_assocCount) break;
+                    if (PtInRect(&(RECT){ startX + S(490), startY + i*rowH + S(10), startX + S(520), startY + i*rowH + S(34) }, (POINT){mx, my})) {
+                        StartDeleteAnimation(2, idx, i);
+                        return 0;
+                    }
+                }
+                if (PtInRect(&(RECT){startX, startY + VISIBLE_ASSOCS*rowH + S(10), startX+S(100), startY + VISIBLE_ASSOCS*rowH + S(34)}, (POINT){mx, my})) {
+                    if (g_assocCount < MAX_ASSOCS) { 
+                        SyncEdits(FALSE); 
+                        lstrcpyW(g_assocs[g_assocCount].name, L"Media"); 
+                        lstrcpyW(g_assocs[g_assocCount].exePath, L"C:\\"); 
+                        lstrcpyW(g_assocs[g_assocCount].exts, L".mp4 .avi"); 
+                        g_assocCount++; 
+                        UpdateMaxScroll();
+                        SyncEdits(TRUE); 
+                        InvalidateRect(h, NULL, TRUE); 
+                    }
+                }
+            }
+            
+            // Вкладка Корзина
+            if (g_currentTab == 3) {
+                for (int i=0; i<3; i++) { 
+                    if (PtInRect(&(RECT){ S(180) + i*S(120), S(100), S(180) + i*S(120) + S(80), S(180) }, (POINT){mx, my})) { 
+                        g_trashSkin = i; 
+                        // Вспышка при выборе корзины
+                        g_flash.active = TRUE;
+                        g_flash.tab = 3;
+                        g_flash.type = 0;
+                        g_flash.progress = 0.0f;
+                        g_flash.startTime = GetTickCountMs();
+                        InvalidateRect(h, NULL, TRUE); 
+                    } 
+                }
+            }
+            
+            // Вкладка Вид - переключение тёмного режима
+            if (g_currentTab == 4) {
+                if (PtInRect(&(RECT){ S(180), S(100), S(500), S(120) }, (POINT){mx, my})) { 
+                    g_darkMode = !g_darkMode; 
+                    // Вспышка при переключении темы
+                    g_flash.active = TRUE;
+                    g_flash.tab = 4;
+                    g_flash.type = 1;
+                    g_flash.progress = 0.0f;
+                    g_flash.startTime = GetTickCountMs();
+                    InvalidateRect(h, NULL, TRUE); 
+                }
+            }
+        } return 0;
+        
+        case WM_ERASEBKGND: return 1;
+        
+        case WM_PAINT: {
+            PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); RECT cr; GetClientRect(h, &cr);
+            HBRUSH bg = CreateSolidBrush(g_darkMode ? RGB(20, 20, 20) : RGB(245, 245, 245)); FillRect(dc, &cr, bg); DeleteObject(bg);
+            
+            RECT titleR = cr; titleR.bottom = S(30); DrawPinstripe(dc, titleR);
+            HFONT ftTitle; PickClassicFont(&ftTitle, 15, TRUE); HGDIOBJ oldF = SelectObject(dc, ftTitle);
+            SetBkMode(dc, TRANSPARENT); SetTextColor(dc, g_darkMode ? RGB(180,255,0) : RGB(0,0,0));
+            TextOutW(dc, cr.right / 2 - S(80), S(6), L"Системный Конфигуратор", 22);
+            
+            RECT cb = { S(8), S(6), S(22), S(20) }; DrawClassicBezel(dc, cb);
+            HPEN pCross = CreatePen(PS_SOLID, 1, g_darkMode ? RGB(180,255,0) : RGB(0,0,0)); HGDIOBJ oldP = SelectObject(dc, pCross);
+            MoveToEx(dc, cb.left+S(3), cb.top+S(3), NULL); LineTo(dc, cb.right-S(3), cb.bottom-S(3));
+            MoveToEx(dc, cb.right-S(3), cb.top+S(3), NULL); LineTo(dc, cb.left+S(3), cb.bottom-S(3));
+            SelectObject(dc, oldP); DeleteObject(pCross);
+            
+            RECT menuR = { 0, S(30), S(140), cr.bottom }; HBRUSH menuBg = CreateSolidBrush(g_darkMode ? RGB(35, 35, 35) : RGB(230, 230, 230)); FillRect(dc, &menuR, menuBg); DeleteObject(menuBg);
+            HPEN divPen = CreatePen(PS_SOLID, 1, g_darkMode ? RGB(100,100,0) : RGB(100, 100, 100)); oldP = SelectObject(dc, divPen);
+            MoveToEx(dc, S(140), S(30), NULL); LineTo(dc, S(140), cr.bottom); SelectObject(dc, oldP); DeleteObject(divPen);
+            
+            const wchar_t* tabs[] = { L"Иконки", L"Избранное", L"Ассоциации", L"Корзина", L"Вид" };
+            HFONT ftMenu; PickClassicFont(&ftMenu, 14, TRUE); SelectObject(dc, ftMenu);
+            for (int i = 0; i < 5; i++) {
+                RECT tr = { 0, S(40) + i * S(40), S(140), S(40) + (i + 1) * S(40) };
+                if (g_currentTab == i) { HBRUSH actBg = CreateSolidBrush(g_darkMode ? RGB(180,255,0) : RGB(0, 0, 0)); FillRect(dc, &tr, actBg); DeleteObject(actBg); SetTextColor(dc, g_darkMode ? RGB(0,0,0) : RGB(255, 255, 255)); } 
+                else { SetTextColor(dc, g_darkMode ? RGB(180,255,0) : RGB(0,0,0)); }
+                DrawTextW(dc, tabs[i], -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+            
+            SetTextColor(dc, g_darkMode ? RGB(180,255,0) : RGB(0,0,0)); HFONT ftBody; PickClassicFont(&ftBody, 15, FALSE); SelectObject(dc, ftBody);
+            
+            int startX = S(160); int startY = S(80); int rowH = S(40);
+            
+            if (g_currentTab == 0) {
+                TextOutW(dc, startX, S(50), L"Назначение Иконок (ki_settings.txt):", 36);
+                
+                // Скролл-кнопки
+                if (g_mappingMaxScroll > 0) {
+                    DrawScrollButtons(dc, startX + S(250), startY - S(10), g_mappingMaxScroll, g_mappingScroll);
+                }
+                
+                for (int i=0; i<VISIBLE_MAPPINGS; i++) {
+                    int idx = g_mappingScroll + i; if (idx >= g_mappingCount) break;
+                    int y = startY + i*rowH;
+                    
+                    // Анимация удаления - пропускаем рисование удаляемой строки
+                    if (g_delAnim.active && g_delAnim.tab == 0 && g_delAnim.rowIndex == i) {
+                        continue;
+                    }
+                    
+                    DrawMiniBtn(dc, (RECT){ startX + S(90), y + S(10), startX + S(115), y + S(34) }, L"<");
+                    RECT icR = { startX + S(125), y + S(7), startX + S(157), y + S(39) }; 
+                    DrawIconByType(dc, icR, g_mappings[idx].iconId);
+                    DrawMiniBtn(dc, (RECT){ startX + S(165), y + S(10), startX + S(190), y + S(34) }, L">");
+                    DrawMiniBtn(dc, (RECT){ startX + S(200), y + S(10), startX + S(230), y + S(34) }, L"X");
+                }
+                DrawMiniBtn(dc, (RECT){ startX, startY + VISIBLE_MAPPINGS*rowH + S(10), startX + S(100), startY + VISIBLE_MAPPINGS*rowH + S(34) }, L"Добавить +");
+            } 
+            else if (g_currentTab == 1) {
+                TextOutW(dc, startX, S(50), L"Избранное (Имя -- Путь) (ki_favorites.txt):", 43);
+                
+                if (g_favMaxScroll > 0) {
+                    DrawScrollButtons(dc, startX + S(450), startY - S(10), g_favMaxScroll, g_favScroll);
+                }
+                
+                for (int i=0; i<VISIBLE_FAVS; i++) {
+                    int idx = g_favScroll + i; if (idx >= g_favCount) break;
+                    
+                    if (g_delAnim.active && g_delAnim.tab == 1 && g_delAnim.rowIndex == i) {
+                        continue;
+                    }
+                    
+                    DrawMiniBtn(dc, (RECT){ startX + S(390), startY + i*rowH + S(10), startX + S(420), startY + i*rowH + S(34) }, L"X");
+                }
+                DrawMiniBtn(dc, (RECT){ startX, startY + VISIBLE_FAVS*rowH + S(10), startX + S(100), startY + VISIBLE_FAVS*rowH + S(34) }, L"Добавить +");
+            }
+            else if (g_currentTab == 2) {
+                TextOutW(dc, startX, S(50), L"Ассоциации (Имя -- EXE -- Расширения) (ki_assoc.txt):", 53);
+                
+                if (g_assocMaxScroll > 0) {
+                    DrawScrollButtons(dc, startX + S(550), startY - S(10), g_assocMaxScroll, g_assocScroll);
+                }
+                
+                for (int i=0; i<VISIBLE_ASSOCS; i++) {
+                    int idx = g_assocScroll + i; if (idx >= g_assocCount) break;
+                    
+                    if (g_delAnim.active && g_delAnim.tab == 2 && g_delAnim.rowIndex == i) {
+                        continue;
+                    }
+                    
+                    DrawMiniBtn(dc, (RECT){ startX + S(490), startY + i*rowH + S(10), startX + S(520), startY + i*rowH + S(34) }, L"X");
+                }
+                DrawMiniBtn(dc, (RECT){ startX, startY + VISIBLE_ASSOCS*rowH + S(10), startX + S(100), startY + VISIBLE_ASSOCS*rowH + S(34) }, L"Добавить +");
+            }
+            else if (g_currentTab == 3) {
+                TextOutW(dc, S(180), S(60), L"Выберите дизайн корзины:", 24);
+                for (int i=0; i<3; i++) {
+                    RECT ir = { S(180) + i*S(120), S(100), S(180) + i*S(120) + S(80), S(180) };
+                    if (g_trashSkin == i) { 
+                        RECT hl = ir; InflateRect(&hl, S(8), S(8)); 
+                        HBRUSH hb = CreateSolidBrush(g_darkMode ? RGB(180,255,0) : RGB(180, 210, 255)); 
+                        FillRect(dc, &hl, hb); 
+                        DeleteObject(hb); 
+                    }
+                    if (i==0) DrawTrash_Classic(dc, ir); 
+                    else if (i==1) DrawTrash_Mesh(dc, ir); 
+                    else DrawTrash_Boxy(dc, ir);
+                    
+                    // Вспышка при выборе корзины
+                    if (g_flash.active && g_flash.type == 0 && g_trashSkin == i) {
+                        DrawFlashFeedback(dc, ir, g_flash.progress);
+                    }
+                }
+            } 
+            else if (g_currentTab == 4) {
+                TextOutW(dc, S(180), S(60), L"Стиль интерфейса", 16);
+                
+                RECT tgR = { S(180), S(100), S(180) + S(16), S(100) + S(16) }; 
+                DrawClassicBezel(dc, tgR);
+
+                if (g_darkMode) { 
+                    HPEN crossPen = CreatePen(PS_SOLID, S(2), RGB(180, 255, 0));
+                    HGDIOBJ oldP2 = SelectObject(dc, crossPen);
+                    MoveToEx(dc, tgR.left + S(3), tgR.top + S(3), NULL); 
+                    LineTo(dc, tgR.right - S(3), tgR.bottom - S(3));
+                    MoveToEx(dc, tgR.right - S(3), tgR.top + S(3), NULL); 
+                    LineTo(dc, tgR.left + S(3), tgR.bottom - S(3));
+                    SelectObject(dc, oldP2); DeleteObject(crossPen);
+                } else {
+                    HPEN fillPen = CreatePen(PS_SOLID, S(1), RGB(0,0,0));
+                    HGDIOBJ oldP2 = SelectObject(dc, fillPen);
+                    HBRUSH fillBr = CreateSolidBrush(RGB(0,0,0));
+                    HGDIOBJ oldB2 = SelectObject(dc, fillBr);
+                    Rectangle(dc, tgR.left + S(3), tgR.top + S(3), tgR.right - S(3), tgR.bottom - S(3));
+                    SelectObject(dc, oldB2); DeleteObject(fillBr);
+                    SelectObject(dc, oldP2); DeleteObject(fillPen);
+                }
+                SetTextColor(dc, g_darkMode ? RGB(180, 255, 0) : RGB(0, 0, 0)); 
+                TextOutW(dc, S(210), S(100), L"Включить неоновый темный режим", 30);
+                
+                // Вспышка при переключении темы
+                if (g_flash.active && g_flash.type == 1) {
+                    RECT flashR = { S(170), S(90), S(500), S(130) };
+                    DrawFlashFeedback(dc, flashR, g_flash.progress);
+                }
+            }
+            
+            // Вспышка на кнопке Save
+            if (g_flash.active && g_flash.type == 2 && g_hApplyBtn) {
+                RECT btnR; GetWindowRect(g_hApplyBtn, &btnR);
+                MapWindowPoints(HWND_DESKTOP, h, (POINT*)&btnR, 2);
+                DrawFlashFeedback(dc, btnR, g_flash.progress);
+            }
+            
+            DrawClassicBezel(dc, cr); SelectObject(dc, oldF); DeleteObject(ftTitle); DeleteObject(ftMenu); DeleteObject(ftBody); EndPaint(h, &ps);
+        } return 0;
+        
+        case WM_DESTROY: 
+            if (g_hDarkBrush) DeleteObject(g_hDarkBrush); 
+            if (g_animTimer) KillTimer(h, g_animTimer);
+            PostQuitMessage(0); 
+            return 0;
+    } return DefWindowProcW(h, m, w, l);
+}
+
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, PWSTR lpCmdLine, int nCmdShow) {
+    g_hInst = hInst; SetDpiAware();
+    WNDCLASSW wc = { 0 }; wc.style = CS_HREDRAW | CS_VREDRAW; wc.lpfnWndProc = SettingsWndProc; wc.hInstance = hInst; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); wc.lpszClassName = kWndClass; RegisterClassW(&wc);
+    int W = S(700), H = S(520); int sx = GetSystemMetrics(SM_CXSCREEN); int sy = GetSystemMetrics(SM_CYSCREEN);
+    HWND win = CreateWindowExW(WS_EX_TOPMOST, kWndClass, L"Configurator", WS_POPUP | WS_CLIPCHILDREN, (sx - W) / 2, (sy - H) / 2, W, H, NULL, NULL, hInst, NULL);
+    ShowWindow(win, SW_SHOWDEFAULT); UpdateWindow(win);
+    MSG msg; while (GetMessageW(&msg, NULL, 0, 0)) { if (!IsDialogMessage(win, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); } }
+    return 0;
+}
