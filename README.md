@@ -100,13 +100,26 @@ Elevator works, you can tap on black poit if you want back
 <img width="622" height="681" alt="Screenshot_4" src="https://github.com/user-attachments/assets/f26c76a2-471c-446d-9f58-5fc14018dd9f" />
 Dont forget tap on chooser one more if you want remove check mark mode
 
-<img width="425" height="451" alt="Screenshot_6" src="https://github.com/user-attachments/assets/d844872f-2c68-4226-920a-1844387b7208" />
+
+
+<img width="377" height="410" alt="Screenshot_29" src="https://github.com/user-attachments/assets/075ab1cc-88a3-4e83-97b5-7d202ad77e54" />
 context menu
+
+
 
 <img width="487" height="383" alt="Screenshot_7" src="https://github.com/user-attachments/assets/6b778eb5-fefc-4408-9139-f2a03d32615c" />
 Computer teleport you in disk view space
+
+
 
 <img width="700" height="518" alt="Screenshot_18" src="https://github.com/user-attachments/assets/527e5f5c-5b2c-484b-90ec-2769ee7fa24f" />
 Settings
 3 type bin as gift)
 Program will be translated, on eng in future
+
+**Nuance**
+1) The program supports up to 4 file operations simultaneously. 
+2) The program minimizes when left-clicked.
+3) The program sorts new files in descending order (newest first) when sorted by date. 4)
+4) You can exit the program using the "Exit" button. 
+5) Occasionally, you may need to click "Refresh" for the program to load all data regarding the folder and its files.
